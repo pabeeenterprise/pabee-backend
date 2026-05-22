@@ -1,0 +1,58 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL") // Required for Supabase
+}
+
+model Vendor {
+  id           String     @id @default(uuid())
+  name         String
+  businessType String     
+  tier         Int        @default(1)
+  defaultTable String     @default("Counter")
+  passcode     String     @default("1234")      // <--- ADD THIS LINE
+  
+  menuItems    MenuItem[]
+  orders       Order[]
+}
+
+model MenuItem {
+  id          String   @id @default(uuid())
+  vendorId    String
+  vendor      Vendor   @relation(fields: [vendorId], references: [id])
+  name        String
+  category    String
+  price       Float
+  prep        String   
+  veg         Boolean  @default(true)
+  available   Boolean  @default(true)
+}
+
+model Order {
+  id            String      @id @default(uuid())
+  vendorId      String
+  vendor        Vendor      @relation(fields: [vendorId], references: [id])
+  tableId       String
+  token         Int         @default(autoincrement())
+  status        String      @default("received")
+  kitchenStatus String      @default("pending")
+  total         Float
+  paymentMode   String
+  customerPhone String?
+  createdAt     DateTime    @default(now())
+  
+  items         OrderItem[]
+}
+
+model OrderItem {
+  id        String  @id @default(uuid())
+  orderId   String
+  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  name      String
+  qty       Int
+  price     Float
+}
