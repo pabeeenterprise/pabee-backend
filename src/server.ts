@@ -116,7 +116,11 @@ app.post('/api/otp/send', async (req, res) => {
   }
 
   // Ensure the phone number contains the country code (e.g., 91 for India) without '+' symbols
-  const formattedPhone = phone.replace(/\D/g, '');
+  let formattedPhone = phone.replace(/\D/g, ''); // Changed 'const' to 'let'
+
+  if (formattedPhone.length === 10) {
+    formattedPhone = `91${formattedPhone}`;
+  }
 
   const authKey = process.env.MSG91_AUTH_KEY;
   const templateId = process.env.MSG91_TEMPLATE_ID;
