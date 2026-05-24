@@ -108,21 +108,24 @@ app.patch('/api/orders/:orderId/kitchen-status', async (req, res) => {
   }
 });
 
-// 5. Send OTP via Real MSG91 API Gateway
+// 5. Send OTP (MOCKED FOR DEVELOPMENT)
 app.post('/api/otp/send', async (req, res) => {
   const { phone } = req.body;
   if (!phone) {
     return res.status(400).json({ error: 'Phone number is required' });
   }
 
-  // Ensure the phone number contains the country code (e.g., 91 for India) without '+' symbols
-  let formattedPhone = phone.replace(/\D/g, ''); // Changed 'const' to 'let'
+  let formattedPhone = phone.replace(/\D/g, ''); 
 
   if (formattedPhone.length === 10) {
     formattedPhone = `91${formattedPhone}`;
   }
 
-  const authKey = process.env.MSG91_AUTH_KEY;
+  // 🌟 THE MISSING LINE: Instantly tell the frontend it was a "success"
+  console.log(`[MOCK] Pretending to send OTP to ${formattedPhone}`);
+  return res.json({ sent: true, phone: formattedPhone });
+
+ /* const authKey = process.env.MSG91_AUTH_KEY;
   const templateId = process.env.MSG91_TEMPLATE_ID;
 
   if (!authKey || !templateId) {
@@ -150,10 +153,10 @@ app.post('/api/otp/send', async (req, res) => {
   } catch (error) {
     console.error("Network Error communicating with MSG91:", error);
     return res.status(500).json({ error: 'Internal server error communicating with SMS gateway' });
-  }
+  }*/
 });
 
-// 6. Verify OTP via Real MSG91 API Gateway
+// 6. Verify OTP (MOCKED FOR DEVELOPMENT)
 app.post('/api/otp/verify', async (req, res) => {
   const { phone, otp } = req.body;
 
@@ -162,7 +165,15 @@ app.post('/api/otp/verify', async (req, res) => {
   }
 
   const formattedPhone = phone.replace(/\D/g, '');
-  const authKey = process.env.MSG91_AUTH_KEY;
+
+  // 🌟 MOCK VERIFY: Use "1234" as the universal test password
+  if (otp === '1234' || otp === '123456') {
+    console.log(`[MOCK] Successfully verified OTP for ${formattedPhone}`);
+    return res.json({ verified: true, phone: formattedPhone });
+  } else {
+    return res.status(400).json({ error: 'Invalid mock OTP code. Please use 1234.' });
+  }
+ /* const authKey = process.env.MSG91_AUTH_KEY;
 
   if (!authKey) {
     return res.status(500).json({ error: 'SMS Gateway configuration error' });
@@ -187,7 +198,7 @@ app.post('/api/otp/verify', async (req, res) => {
   } catch (error) {
     console.error("Network Error during MSG91 verification:", error);
     return res.status(500).json({ error: 'Internal server error verifying token code' });
-  }
+  } */
 });
 
 // 7. Get Vendor Sales Dashboard Data
