@@ -74,25 +74,19 @@ app.post('/api/orders', async (req, res) => {
   try {
     const { vendorId, tableId, items, total, paymentMode, customerPhone } = req.body;
 
-    // Prisma requires us to format the nested items explicitly. 
-    // We only send the fields the database actually expects!
     const newOrder = await prisma.order.create({
       data: {
         vendorId,
-        tableId: tableId || 'Table-4', // 👈 ADD THIS LINE BACK IN!
+        tableId: tableId || 'Table-4',
         total,
         paymentMode,
         kitchenStatus: 'pending',
-        // Depending on your schema, you might also need tableId or customerPhone here:
-        // tableId: tableId || 'Table-4',
-        // customerPhone: customerPhone || '9876543210',
         
         items: {
           create: items.map((cartItem: any) => ({
             name: cartItem.name,
             qty: cartItem.qty,
-            // If your Prisma schema expects a connection to the menu item instead of just a name, 
-            // you would use: menuItemId: cartItem.id 
+            price: cartItem.price // 👈 THE MISSING PIECE
           }))
         }
       }
@@ -101,7 +95,6 @@ app.post('/api/orders', async (req, res) => {
     res.status(201).json(newOrder);
 
   } catch (error) {
-    // THIS is the magic line. If it crashes now, it will scream in the Render logs.
     console.error("🔥 CRITICAL PRISMA ERROR IN /api/orders:", error); 
     res.status(500).json({ error: "Failed to create order" });
   }
