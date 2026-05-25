@@ -10,7 +10,7 @@ app.use(cors({
   origin: [
     'http://localhost:5173', // Your local Vite server
     'http://localhost:3000', 
-    'https://project-r73rm.vercel.app' // 👈 IMPORTANT: Paste your actual live Vercel link here!
+    'https://project-r73rm.vercel.app' // 👈 IMPORTANT: live Vercel link here!
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
@@ -71,19 +71,39 @@ app.get('/api/vendors/:vendorId/menu', async (req, res) => {
 
 // 2. Create Order (Checkout)
 app.post('/api/orders', async (req, res) => {
-  const { vendorId, tableId, items, total, paymentMode, customerPhone } = req.body;
   try {
-    const order = await prisma.order.create({
+    const { vendorId, tableId, items, total, paymentMode, customerPhone } = req.body;
+
+    // Prisma requires us to format the nested items explicitly. 
+    // We only send the fields the database actually expects!
+    const newOrder = await prisma.order.create({
       data: {
-        vendorId, tableId, total, paymentMode, customerPhone,
+        vendorId,
+        tableId: tableId || 'Table-4', // 👈 ADD THIS LINE BACK IN!
+        total,
+        paymentMode,
+        kitchenStatus: 'pending',
+        // Depending on your schema, you might also need tableId or customerPhone here:
+        // tableId: tableId || 'Table-4',
+        // customerPhone: customerPhone || '9876543210',
+        
         items: {
-          create: items.map((item: any) => ({ name: item.name, qty: item.qty, price: item.price }))
+          create: items.map((cartItem: any) => ({
+            name: cartItem.name,
+            qty: cartItem.qty,
+            // If your Prisma schema expects a connection to the menu item instead of just a name, 
+            // you would use: menuItemId: cartItem.id 
+          }))
         }
       }
     });
-    res.status(201).json(order);
+
+    res.status(201).json(newOrder);
+
   } catch (error) {
-    res.status(500).json({ error: 'Failed to create order' });
+    // THIS is the magic line. If it crashes now, it will scream in the Render logs.
+    console.error("🔥 CRITICAL PRISMA ERROR IN /api/orders:", error); 
+    res.status(500).json({ error: "Failed to create order" });
   }
 });
 
