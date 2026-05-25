@@ -6,7 +6,16 @@ import { PrismaClient } from '@prisma/client';
 const prisma = new PrismaClient();
 const app = express();
 
-app.use(cors());
+app.use(cors({
+  origin: [
+    'http://localhost:5173', // Your local Vite server
+    'http://localhost:3000', 
+    'https://project-r73rm.vercel.app' // 👈 IMPORTANT: Paste your actual live Vercel link here!
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
+}));
+
 app.use(express.json());
 
 // --- 🌟 UPDATED AUTO-SEED FUNCTION 🌟 ---
@@ -105,6 +114,23 @@ app.patch('/api/orders/:orderId/kitchen-status', async (req, res) => {
     res.json(order);
   } catch (error) {
     res.status(500).json({ error: 'Failed to update status' });
+  }
+});
+
+
+// 4.5 Check Single Order Status (For the Customer Pickup Screen)
+app.get('/api/orders/:orderId/status', async (req, res) => {
+  const { orderId } = req.params;
+  try {
+    const order = await prisma.order.findUnique({ 
+      where: { id: orderId },
+      select: { id: true, kitchenStatus: true } // We only need the status
+    });
+    
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    res.json(order);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch status' });
   }
 });
 
