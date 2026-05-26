@@ -2,7 +2,12 @@ import express from 'express';
 import jwt from 'jsonwebtoken';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
+import Razorpay from 'razorpay';
 
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_YOUR_KEY_HERE',
+  key_secret: process.env.RAZORPAY_KEY_SECRET || 'YOUR_SECRET_HERE',
+});
 const prisma = new PrismaClient();
 const app = express();
 
@@ -283,6 +288,25 @@ app.post('/api/vendors/login', async (req, res) => {
     }
   } catch (error) {
     res.status(500).json({ error: 'Server error during login' });
+  }
+});
+
+
+app.post('/api/razorpay/create-order', async (req, res) => {
+  try {
+    const { amount } = req.body;
+
+    const options = {
+      amount: amount * 100, // Razorpay expects amount in paise (₹1 = 100 paise)
+      currency: "INR",
+      receipt: `receipt_${Math.floor(Math.random() * 10000)}`,
+    };
+
+    const order = await razorpay.orders.create(options);
+    res.json(order);
+  } catch (error) {
+    console.error("Razorpay Error:", error);
+    res.status(500).json({ error: "Failed to create Razorpay order" });
   }
 });
 
