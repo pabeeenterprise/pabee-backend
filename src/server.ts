@@ -5,8 +5,8 @@ import { PrismaClient } from '@prisma/client';
 import Razorpay from 'razorpay';
 
 const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_YOUR_KEY_HERE',
-  key_secret: process.env.RAZORPAY_KEY_SECRET || 'YOUR_SECRET_HERE',
+  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_1234567890abcd',
+  key_secret: process.env.RAZORPAY_KEY_SECRET || '1234567890abcdef1234567890abcdef',
 });
 const prisma = new PrismaClient();
 const app = express();
