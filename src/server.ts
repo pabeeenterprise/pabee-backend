@@ -63,6 +63,18 @@ async function seedDatabase() {
 seedDatabase();
 // --------------------------------
 
+// 1. Fetch Menu (Customer View)
+app.get('/api/vendors/:vendorId/menu', async (req, res) => {
+  const { vendorId } = req.params;
+  try {
+    // Notice how it only sends items where available: true
+    const items = await prisma.menuItem.findMany({ where: { vendorId, available: true } });
+    res.json({ items });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch menu' });
+  }
+});
+
 // --- MENU EDITOR ROUTES ---
 
 // 1.1 Get ALL Menu Items (Including hidden ones for the Editor)
