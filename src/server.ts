@@ -252,20 +252,15 @@ app.get('/api/vendors/:vendorId/sales', async (req, res) => {
     // Fetch all completed orders
     const orders = await prisma.order.findMany({
       where: { vendorId, kitchenStatus: 'completed' },
+      include: { items: true }, // 👈 CRUCIAL: Include the items for the "Top Selling" calculation!
       orderBy: { createdAt: 'desc' }, // Newest first
     });
 
-    const totalRevenue = orders.reduce((sum, order) => sum + order.total, 0);
-    const totalOrders = orders.length;
-    const averageOrderValue = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
-
-    res.json({ 
-      totalRevenue, 
-      totalOrders, 
-      averageOrderValue,
-      recentOrders: orders.slice(0, 10) // Only send the last 10 for the quick view
-    });
+    // 3. Send it back EXACTLY how the frontend Overview tab expects it
+    res.json({ orders: orders }); 
+    
   } catch (error) {
+    console.error("Sales Endpoint Error:", error);
     res.status(500).json({ error: 'Failed to fetch sales data' });
   }
 });
