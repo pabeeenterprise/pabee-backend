@@ -63,14 +63,57 @@ async function seedDatabase() {
 seedDatabase();
 // --------------------------------
 
-// 1. Fetch Menu (Customer View)
-app.get('/api/vendors/:vendorId/menu', async (req, res) => {
-  const { vendorId } = req.params;
+// --- MENU EDITOR ROUTES ---
+
+// 1.1 Get ALL Menu Items (Including hidden ones for the Editor)
+app.get('/api/vendors/:vendorId/menu-editor', async (req, res) => {
   try {
-    const items = await prisma.menuItem.findMany({ where: { vendorId, available: true } });
+    const items = await prisma.menuItem.findMany({ 
+      where: { vendorId: req.params.vendorId },
+      orderBy: { category: 'asc' }
+    });
     res.json({ items });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch menu' });
+    res.status(500).json({ error: 'Failed to fetch menu for editor' });
+  }
+});
+
+// 1.2 Add New Item
+app.post('/api/vendors/:vendorId/menu', async (req, res) => {
+  try {
+    const { name, category, price, prep, veg, available } = req.body;
+    const newItem = await prisma.menuItem.create({
+      data: {
+        vendorId: req.params.vendorId,
+        name, category, price: Number(price), prep: prep || '10 min', veg, available
+      }
+    });
+    res.json(newItem);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to add item' });
+  }
+});
+
+// 1.3 Update Item (Edit details or toggle In-Stock/Out-of-Stock)
+app.patch('/api/vendors/:vendorId/menu/:itemId', async (req, res) => {
+  try {
+    const updatedItem = await prisma.menuItem.update({
+      where: { id: req.params.itemId },
+      data: req.body // Prisma is smart enough to only update the fields provided
+    });
+    res.json(updatedItem);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update item' });
+  }
+});
+
+// 1.4 Delete Item
+app.delete('/api/vendors/:vendorId/menu/:itemId', async (req, res) => {
+  try {
+    await prisma.menuItem.delete({ where: { id: req.params.itemId } });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete item' });
   }
 });
 
