@@ -129,6 +129,110 @@ app.delete('/api/vendors/:vendorId/menu/:itemId', async (req, res) => {
   }
 });
 
+
+// --- 🎟️ OFFERS & PROMOS ROUTES ---
+
+// 1. Get all promos (For Vendor Dashboard)
+app.get('/api/vendors/:vendorId/promos', async (req, res) => {
+  try {
+    const promos = await prisma.promo.findMany({
+      where: { vendorId: req.params.vendorId },
+      orderBy: { createdAt: 'desc' }
+    });
+    res.json({ promos });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch promos' });
+  }
+});
+
+// 2. Create a new promo
+app.post('/api/vendors/:vendorId/promos', async (req, res) => {
+  try {
+    const { code, type, value, minOrderValue, maxUses, expiresAt, isActive } = req.body;
+    
+    const newPromo = await prisma.promo.create({
+      data: {
+        vendorId: req.params.vendorId,
+        code: code.toUpperCase(), // Always force uppercase!
+        type,
+        value: Number(value),
+        minOrderValue: Number(minOrderValue || 0),
+        maxUses: maxUses ? Number(maxUses) : null,
+        expiresAt: expiresAt ? new Date(expiresAt) : null,
+        isActive
+      }
+    });
+    res.json(newPromo);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create promo. Code might already exist.' });
+  }
+});
+
+// 3. Delete a promo
+app.delete('/api/vendors/:vendorId/promos/:promoId', async (req, res) => {
+  try {
+    await prisma.promo.delete({ where: { id: req.params.promoId } });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete promo' });
+  }
+});
+
+// 4. 🛑 VERIFY A PROMO (For Customer Checkout) - THE IMPORTANT MATH!
+app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
+  try {
+    const { code, cartTotal } = req.body;
+    
+    // Find the promo
+    const promo = await prisma.promo.findUnique({
+      where: {
+        vendorId_code: { vendorId: req.params.vendorId, code: code.toUpperCase() }
+      }
+    });
+
+    // Rule 1: Does it exist and is it turned on?
+    if (!promo || !promo.isActive) {
+      return res.status(400).json({ error: 'Invalid or inactive promo code.' });
+    }
+
+    // Rule 2: Did they spend enough?
+    if (cartTotal < promo.minOrderValue) {
+      return res.status(400).json({ error: `Cart must be at least ₹${promo.minOrderValue} to use this code.` });
+    }
+
+    // Rule 3: Is it expired?
+    if (promo.expiresAt && new Date() > promo.expiresAt) {
+      return res.status(400).json({ error: 'This promo code has expired.' });
+    }
+
+    // Rule 4: Has it been used too many times?
+    if (promo.maxUses !== null && promo.currentUses >= promo.maxUses) {
+      return res.status(400).json({ error: 'This promo code has reached its usage limit.' });
+    }
+
+    // If it passes all rules, calculate the discount!
+    let discountAmount = 0;
+    if (promo.type === 'FLAT') {
+      discountAmount = promo.value;
+    } else if (promo.type === 'PERCENTAGE') {
+      discountAmount = (cartTotal * promo.value) / 100;
+    }
+
+    // Don't let the discount be more than the cart total itself!
+    if (discountAmount > cartTotal) discountAmount = cartTotal;
+
+    res.json({ 
+      success: true, 
+      promoId: promo.id,
+      discountAmount: Math.round(discountAmount), 
+      newTotal: Math.round(cartTotal - discountAmount) 
+    });
+
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to verify promo.' });
+  }
+});
+
 // 2. Create Order (Checkout)
 app.post('/api/orders', async (req, res) => {
   try {

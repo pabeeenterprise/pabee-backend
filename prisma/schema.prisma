@@ -18,6 +18,8 @@ model Vendor {
   
   menuItems    MenuItem[]
   orders       Order[]
+
+  promos       Promo[]
 }
 
 model MenuItem {
@@ -55,4 +57,23 @@ model OrderItem {
   name      String
   qty       Int
   price     Float
+}
+
+// --- NEW PROMO TABLE ---
+model Promo {
+  id            String    @id @default(uuid())
+  vendorId      String
+  code          String    // e.g., "DIWALI50" (We will convert this to UPPERCASE)
+  type          String    // "FLAT" or "PERCENTAGE"
+  value         Float     // e.g., 50 (₹50 off) or 15 (15% off)
+  minOrderValue Float     @default(0) // Order must be >= this amount
+  maxUses       Int?      // Null means unlimited. Otherwise, stops at this number.
+  currentUses   Int       @default(0)
+  expiresAt     DateTime? // Null means it never expires.
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+
+  vendor        Vendor    @relation(fields: [vendorId], references: [id])
+
+  @@unique([vendorId, code]) // A vendor can't have two identical codes active
 }
