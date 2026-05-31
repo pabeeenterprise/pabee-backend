@@ -233,61 +233,120 @@ app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
   }
 });
 
-// --- 📊 ANALYTICS ROUTE ---
+// --- 📊 ADVANCED ANALYTICS ROUTE (TypeScript Safe!) ---
 app.get('/api/vendors/:vendorId/analytics', async (req, res) => {
   try {
-    // 1. Figure out what "30 days ago" was
+    const today = new Date();
     const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    thirtyDaysAgo.setDate(today.getDate() - 30);
 
-    // 2. Fetch all orders from the last 30 days for this vendor
+    // FIX 1: Add include: { items: true } so Prisma actually fetches the food items!
     const orders = await prisma.order.findMany({
       where: {
         vendorId: req.params.vendorId,
         createdAt: { gte: thirtyDaysAgo }
+      },
+      include: {
+        items: true 
       }
     });
 
-    // 3. Crunch the top-level numbers
     const totalOrders = orders.length;
-    const totalRevenue = orders.reduce((sum, order) => sum + order.total, 0);
-    const avgOrder = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
-
-    // 4. Calculate the Payment Split (UPI vs Cash)
+    let totalRevenue = 0;
     let upi = 0, cash = 0, card = 0;
-    orders.forEach(o => {
+
+    // Added (o: any) to satisfy TypeScript
+    orders.forEach((o: any) => {
+      totalRevenue += o.total;
       if (o.paymentMode === 'UPI') upi++;
       else if (o.paymentMode === 'CASH') cash++;
       else card++;
     });
-    
-    // Helper function to turn counts into percentages
-    const calcPercent = (val) => totalOrders > 0 ? Math.round((val / totalOrders) * 100) : 0;
 
-    // 5. Send the real data back! 
-    // (We will keep Top Items and Peak Hours mocked for today so your UI stays pretty, as those require some complex database grouping)
+    const avgOrder = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
+    const calcPercent = (val: number) => totalOrders > 0 ? Math.round((val / totalOrders) * 100) : 0;
+
+    // ==========================================
+    // 🧠 3. THE ADVANCED MATH: Top Items
+    // ==========================================
+    // FIX 2: Explicitly tell TypeScript this is an object holding anything
+    const itemTracker: Record<string, any> = {};
+    
+    orders.forEach((order: any) => {
+      const items = Array.isArray(order.items) ? order.items : [];
+      items.forEach((item: any) => {
+        if (!itemTracker[item.id]) {
+          itemTracker[item.id] = { id: item.id, name: item.name, rev: 0, sold: 0 };
+        }
+        itemTracker[item.id].rev += (item.price * item.qty);
+        itemTracker[item.id].sold += item.qty;
+      });
+    });
+
+    // FIX 3: Add (a: any, b: any) and (item: any) so TS knows how to sort them
+    const topItems = Object.values(itemTracker)
+      .sort((a: any, b: any) => b.rev - a.rev)
+      .slice(0, 5)
+      .map((item: any) => ({
+        ...item,
+        rev: item.rev.toLocaleString('en-IN')
+      }));
+
+    // ==========================================
+    // 📈 4. THE ADVANCED MATH: 30-Day Trend
+    // ==========================================
+    let dailyRevenue = new Array(30).fill(0);
+    
+    orders.forEach((order: any) => {
+      // FIX 4: Use .getTime() so TypeScript can subtract the dates properly
+      const diffTime = Math.abs(today.getTime() - new Date(order.createdAt).getTime());
+      const daysAgo = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+      
+      if (daysAgo < 30) {
+        const arrayIndex = 29 - daysAgo; 
+        dailyRevenue[arrayIndex] += order.total;
+      }
+    });
+
+    const maxDaily = Math.max(...dailyRevenue, 1);
+    const trend = dailyRevenue.map(rev => Math.round((rev / maxDaily) * 100));
+
+    // ==========================================
+    // ⏰ 5. THE ADVANCED MATH: Peak Hours
+    // ==========================================
+    const hourBuckets = { morning: 0, lunch: 0, evening: 0, night: 0 };
+    
+    orders.forEach((order: any) => {
+      const hour = new Date(order.createdAt).getHours(); 
+      if (hour >= 9 && hour < 12) hourBuckets.morning++;
+      else if (hour >= 12 && hour < 15) hourBuckets.lunch++;
+      else if (hour >= 17 && hour < 20) hourBuckets.evening++;
+      else if (hour >= 20 && hour < 23) hourBuckets.night++;
+    });
+
+    const maxHour = Math.max(hourBuckets.morning, hourBuckets.lunch, hourBuckets.evening, hourBuckets.night, 1);
+    const peakPercent = (val: number) => Math.round((val / maxHour) * 100);
+
+    const peakHours = [
+      { label: '6–8 PM', percentage: peakPercent(hourBuckets.evening) },
+      { label: '8–10 PM', percentage: peakPercent(hourBuckets.night) },
+      { label: '12–2 PM', percentage: peakPercent(hourBuckets.lunch) },
+      { label: '9–11 AM', percentage: peakPercent(hourBuckets.morning) }
+    ];
+
     res.json({
-      revenue: totalRevenue.toLocaleString('en-IN'), // Formats it nicely like 62,400
+      revenue: totalRevenue.toLocaleString('en-IN'),
       orders: totalOrders,
       avgOrder: avgOrder,
-      rating: 4.8, // Hardcoded until we build a review system!
+      rating: 4.8, 
       paymentSplit: [
         { label: 'UPI / QR', percentage: calcPercent(upi), color: 'bg-blue-500' },
         { label: 'Cash', percentage: calcPercent(cash), color: 'bg-[#E5B35C]' },
         { label: 'Card', percentage: calcPercent(card), color: 'bg-gray-500' }
       ],
-      peakHours: [
-        { label: '12–2 PM', percentage: 88 },
-        { label: '6–8 PM', percentage: 95 },
-        { label: '8–10 PM', percentage: 72 },
-        { label: '9–11 AM', percentage: 48 }
-      ],
-      topItems: [
-        { id: 1, name: 'Pav Bhaji', rev: '12,400', sold: 155 },
-        { id: 2, name: 'Sev Puri', rev: '8,640', sold: 144 },
-        { id: 3, name: 'Vada Pav', rev: '6,000', sold: 240 }
-      ],
-      trend: [30, 45, 35, 50, 40, 60, 55, 75, 50, 45, 65, 70, 55, 80, 85, 60, 50, 75, 90, 85, 70, 80, 95, 85, 100, 90, 75, 85, 95, 80]
+      peakHours,
+      topItems,
+      trend
     });
 
   } catch (error) {
