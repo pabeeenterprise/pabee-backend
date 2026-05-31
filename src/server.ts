@@ -233,6 +233,69 @@ app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
   }
 });
 
+// --- 📊 ANALYTICS ROUTE ---
+app.get('/api/vendors/:vendorId/analytics', async (req, res) => {
+  try {
+    // 1. Figure out what "30 days ago" was
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    // 2. Fetch all orders from the last 30 days for this vendor
+    const orders = await prisma.order.findMany({
+      where: {
+        vendorId: req.params.vendorId,
+        createdAt: { gte: thirtyDaysAgo }
+      }
+    });
+
+    // 3. Crunch the top-level numbers
+    const totalOrders = orders.length;
+    const totalRevenue = orders.reduce((sum, order) => sum + order.total, 0);
+    const avgOrder = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
+
+    // 4. Calculate the Payment Split (UPI vs Cash)
+    let upi = 0, cash = 0, card = 0;
+    orders.forEach(o => {
+      if (o.paymentMode === 'UPI') upi++;
+      else if (o.paymentMode === 'CASH') cash++;
+      else card++;
+    });
+    
+    // Helper function to turn counts into percentages
+    const calcPercent = (val) => totalOrders > 0 ? Math.round((val / totalOrders) * 100) : 0;
+
+    // 5. Send the real data back! 
+    // (We will keep Top Items and Peak Hours mocked for today so your UI stays pretty, as those require some complex database grouping)
+    res.json({
+      revenue: totalRevenue.toLocaleString('en-IN'), // Formats it nicely like 62,400
+      orders: totalOrders,
+      avgOrder: avgOrder,
+      rating: 4.8, // Hardcoded until we build a review system!
+      paymentSplit: [
+        { label: 'UPI / QR', percentage: calcPercent(upi), color: 'bg-blue-500' },
+        { label: 'Cash', percentage: calcPercent(cash), color: 'bg-[#E5B35C]' },
+        { label: 'Card', percentage: calcPercent(card), color: 'bg-gray-500' }
+      ],
+      peakHours: [
+        { label: '12–2 PM', percentage: 88 },
+        { label: '6–8 PM', percentage: 95 },
+        { label: '8–10 PM', percentage: 72 },
+        { label: '9–11 AM', percentage: 48 }
+      ],
+      topItems: [
+        { id: 1, name: 'Pav Bhaji', rev: '12,400', sold: 155 },
+        { id: 2, name: 'Sev Puri', rev: '8,640', sold: 144 },
+        { id: 3, name: 'Vada Pav', rev: '6,000', sold: 240 }
+      ],
+      trend: [30, 45, 35, 50, 40, 60, 55, 75, 50, 45, 65, 70, 55, 80, 85, 60, 50, 75, 90, 85, 70, 80, 95, 85, 100, 90, 75, 85, 95, 80]
+    });
+
+  } catch (error) {
+    console.error("Analytics Error:", error);
+    res.status(500).json({ error: 'Failed to fetch analytics' });
+  }
+});
+
 // 2. Create Order (Checkout)
 app.post('/api/orders', async (req, res) => {
   try {
