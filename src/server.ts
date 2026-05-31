@@ -267,23 +267,23 @@ app.get('/api/vendors/:vendorId/analytics', async (req, res) => {
     const calcPercent = (val: number) => totalOrders > 0 ? Math.round((val / totalOrders) * 100) : 0;
 
     // ==========================================
+    // ==========================================
     // 🧠 3. THE ADVANCED MATH: Top Items
     // ==========================================
-    // FIX 2: Explicitly tell TypeScript this is an object holding anything
     const itemTracker: Record<string, any> = {};
     
     orders.forEach((order: any) => {
       const items = Array.isArray(order.items) ? order.items : [];
       items.forEach((item: any) => {
-        if (!itemTracker[item.id]) {
-          itemTracker[item.id] = { id: item.id, name: item.name, rev: 0, sold: 0 };
+        // 👇 Group by NAME instead of ID to merge duplicates!
+        if (!itemTracker[item.name]) {
+          itemTracker[item.name] = { id: item.id, name: item.name, rev: 0, sold: 0 };
         }
-        itemTracker[item.id].rev += (item.price * item.qty);
-        itemTracker[item.id].sold += item.qty;
+        itemTracker[item.name].rev += (item.price * item.qty);
+        itemTracker[item.name].sold += item.qty;
       });
     });
 
-    // FIX 3: Add (a: any, b: any) and (item: any) so TS knows how to sort them
     const topItems = Object.values(itemTracker)
       .sort((a: any, b: any) => b.rev - a.rev)
       .slice(0, 5)
