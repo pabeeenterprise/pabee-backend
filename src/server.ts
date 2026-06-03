@@ -122,6 +122,40 @@ async function seedDatabase() {
 seedDatabase();
 // --------------------------------
 
+// --- ⚙️ SETTINGS & PROFILE ROUTES ---
+
+// 1. Get Vendor Profile
+app.get('/api/vendors/:vendorId/profile', async (req, res) => {
+  try {
+    // We search by clerkId since that is what the frontend Auth context provides
+    const vendor = await prisma.vendor.findUnique({
+      where: { clerkId: req.params.vendorId }
+    });
+    
+    if (!vendor) return res.status(404).json({ error: 'Vendor profile not found' });
+    
+    res.json(vendor);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch vendor profile' });
+  }
+});
+
+// 2. Update Vendor Profile (Store Name & Type)
+app.patch('/api/vendors/:vendorId/profile', async (req, res) => {
+  try {
+    const { name, businessType } = req.body;
+    
+    const updatedVendor = await prisma.vendor.update({
+      where: { clerkId: req.params.vendorId },
+      data: { name, businessType }
+    });
+    
+    res.json(updatedVendor);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update vendor profile' });
+  }
+});
+
 // 1. Fetch Menu (Customer View)
 app.get('/api/vendors/:vendorId/menu', async (req, res) => {
   const { vendorId } = req.params;
