@@ -10,15 +10,18 @@ datasource db {
 
 model Vendor {
   id           String     @id @default(uuid())
-  name         String
-  businessType String     
+  clerkId      String     @unique  // 👈 ADDED: Links DB to the Clerk user
+  email        String     @unique  // 👈 ADDED: Stores their Google/Sign-up email
+
+  name         String?
+  businessType String?    
+
+
   tier         Int        @default(1)
   defaultTable String     @default("Counter")
-  passcode     String     @default("1234")      // <--- ADD THIS LINE
   
   menuItems    MenuItem[]
   orders       Order[]
-
   promos       Promo[]
 }
 

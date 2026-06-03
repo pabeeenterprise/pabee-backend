@@ -3,6 +3,7 @@ import jwt from 'jsonwebtoken';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
 import Razorpay from 'razorpay';
+import { Webhook } from 'svix';
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_1234567890abcd',
@@ -21,6 +22,62 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
 }));
 
+app.post(
+  '/api/webhooks/clerk',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const WEBHOOK_SECRET = process.env.CLERK_WEBHOOK_SECRET;
+    
+    if (!WEBHOOK_SECRET) {
+      console.error('Missing CLERK_WEBHOOK_SECRET in .env');
+      return res.status(500).json({ error: 'Server configuration error' });
+    }
+
+    const svix_id = req.headers['svix-id'] as string;
+    const svix_timestamp = req.headers['svix-timestamp'] as string;
+    const svix_signature = req.headers['svix-signature'] as string;
+
+    if (!svix_id || !svix_timestamp || !svix_signature) {
+      return res.status(400).json({ error: 'Missing Svix headers' });
+    }
+
+    const payload = req.body.toString('utf8');
+    const wh = new Webhook(WEBHOOK_SECRET);
+    let evt;
+
+    try {
+      evt = wh.verify(payload, {
+        'svix-id': svix_id,
+        'svix-timestamp': svix_timestamp,
+        'svix-signature': svix_signature,
+      }) as any;
+    } catch (err: any) {
+      console.error('Webhook verification failed:', err.message);
+      return res.status(400).json({ error: 'Verification failed' });
+    }
+
+    // If it's a new user signup, create their database profile!
+    if (evt.type === 'user.created') {
+      const { id, email_addresses } = evt.data;
+      const primaryEmail = email_addresses[0].email_address;
+
+      try {
+        await prisma.vendor.create({
+          data: {
+            clerkId: id,
+            email: primaryEmail,
+          },
+        });
+        console.log(`✅ Database profile created for new vendor: ${primaryEmail}`);
+      } catch (error) {
+        console.error('🔥 Failed to save new vendor to DB:', error);
+      }
+    }
+
+    return res.status(200).json({ success: true });
+  }
+);
+
 app.use(express.json());
 
 // --- 🌟 UPDATED AUTO-SEED FUNCTION 🌟 ---
@@ -37,6 +94,8 @@ async function seedDatabase() {
         update: {},
         create: {
           id: 'spice-street-kitchen',
+          clerkId: 'dummy_clerk_id_123',     // 👈 ADD THIS LINE
+          email: 'test@spicestreet.com',
           name: 'Spice Street Kitchen',
           businessType: 'Street Food',
           tier: 1,
@@ -546,26 +605,6 @@ app.get('/api/vendors/:vendorId/sales', async (req, res) => {
   }
 });
 
-// 8. Vendor Login (Authentication)
-const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-local-key';
-
-app.post('/api/vendors/login', async (req, res) => {
-  const { vendorId, passcode } = req.body;
-  try {
-    const vendor = await prisma.vendor.findUnique({ where: { id: vendorId } });
-    
-    // In production, NEVER store plain text passwords. You would use bcrypt.compare() here.
-    if (vendor && vendor.passcode === passcode) {
-      // Generate a token that expires in 12 hours
-      const token = jwt.sign({ vendorId: vendor.id, role: 'vendor' }, JWT_SECRET, { expiresIn: '12h' });
-      res.json({ success: true, token });
-    } else {
-      res.status(401).json({ error: 'Invalid Vendor ID or Passcode' });
-    }
-  } catch (error) {
-    res.status(500).json({ error: 'Server error during login' });
-  }
-});
 
 
 app.post('/api/razorpay/create-order', async (req, res) => {
