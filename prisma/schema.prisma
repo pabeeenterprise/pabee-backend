@@ -20,7 +20,7 @@ model Vendor {
   tier         Int        @default(1)
   defaultTable String     @default("Counter")
 
-  / --- BRANDING STUDIO FIELDS ---
+  // --- BRANDING STUDIO FIELDS ---
   logoUrl      String?    // Optional: URL for their uploaded logo
   bannerUrl    String?    // Optional: URL for the top banner image
   primaryColor String     @default("#E5B35C") // Defaults to Pabee Gold
