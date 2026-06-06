@@ -140,19 +140,26 @@ app.get('/api/vendors/:vendorId/profile', async (req, res) => {
   }
 });
 
-// 2. Update Vendor Profile (Store Name & Type)
-app.patch('/api/vendors/:vendorId/profile', async (req, res) => {
+// 2. Get Vendor Profile (SMART ROUTE: Handles both Clerk ID and Database ID)
+app.get('/api/vendors/:vendorId/profile', async (req, res) => {
   try {
-    const { name, businessType } = req.body;
-    
-    const updatedVendor = await prisma.vendor.update({
-      where: { clerkId: req.params.vendorId },
-      data: { name, businessType }
+    // We use findFirst with an OR statement so it works for both 
+    // the Admin Dashboard (Clerk ID) and the Customer QR Menu (Database ID)
+    const vendor = await prisma.vendor.findFirst({
+      where: {
+        OR: [
+          { clerkId: req.params.vendorId },
+          { id: req.params.vendorId }
+        ]
+      }
     });
     
-    res.json(updatedVendor);
+    if (!vendor) return res.status(404).json({ error: 'Vendor profile not found' });
+    
+    res.json(vendor);
   } catch (error) {
-    res.status(500).json({ error: 'Failed to update vendor profile' });
+    console.error("Error fetching vendor profile:", error);
+    res.status(500).json({ error: 'Failed to fetch vendor profile' });
   }
 });
 
@@ -656,6 +663,30 @@ app.post('/api/razorpay/create-order', async (req, res) => {
   } catch (error) {
     console.error("Razorpay Error:", error);
     res.status(500).json({ error: "Failed to create Razorpay order" });
+  }
+});
+
+// --- 🎨 BRANDING STUDIO ROUTE ---
+
+app.patch('/api/vendors/:vendorId/branding', async (req, res) => {
+  try {
+    const { primaryColor, theme, logoUrl, bannerUrl } = req.body;
+    
+    const updatedVendor = await prisma.vendor.update({
+      where: { clerkId: req.params.vendorId },
+      data: { 
+        primaryColor, 
+        theme,
+        // Only update URLs if they were actually provided
+        ...(logoUrl && { logoUrl }),
+        ...(bannerUrl && { bannerUrl })
+      }
+    });
+    
+    res.json(updatedVendor);
+  } catch (error) {
+    console.error("Branding update error:", error);
+    res.status(500).json({ error: 'Failed to update branding settings' });
   }
 });
 
