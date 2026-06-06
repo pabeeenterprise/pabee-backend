@@ -460,9 +460,23 @@ app.post('/api/orders', async (req, res) => {
   try {
     const { vendorId, tableId, items, total, paymentMode, customerPhone } = req.body;
 
+    // 🛡️ THE FIX: Translate the incoming ID (Clerk or DB) to the pure Database ID
+    const vendor = await prisma.vendor.findFirst({
+      where: {
+        OR: [
+          { clerkId: vendorId },
+          { id: vendorId }
+        ]
+      }
+    });
+
+    if (!vendor) {
+      return res.status(404).json({ error: "Vendor not found to attach order to." });
+    }
+
     const newOrder = await prisma.order.create({
       data: {
-        vendorId,
+        vendorId: vendor.id, // 👈 CRUCIAL: We use the translated Database ID here!
         tableId: tableId || 'Table-4',
         total,
         paymentMode,
@@ -472,7 +486,7 @@ app.post('/api/orders', async (req, res) => {
           create: items.map((cartItem: any) => ({
             name: cartItem.name,
             qty: cartItem.qty,
-            price: cartItem.price // 👈 THE MISSING PIECE
+            price: cartItem.price 
           }))
         }
       }
