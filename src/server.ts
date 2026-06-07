@@ -140,12 +140,10 @@ app.get('/api/vendors/:vendorId/profile', async (req, res) => {
   }
 });
 
-// 2. Get Vendor Profile (SMART ROUTE: Handles both Clerk ID and Database ID)
+// 2. Get Vendor Profile (SMART ROUTE WITH SAFETY NET)
 app.get('/api/vendors/:vendorId/profile', async (req, res) => {
   try {
-    // We use findFirst with an OR statement so it works for both 
-    // the Admin Dashboard (Clerk ID) and the Customer QR Menu (Database ID)
-    const vendor = await prisma.vendor.findFirst({
+    let vendor = await prisma.vendor.findFirst({
       where: {
         OR: [
           { clerkId: req.params.vendorId },
@@ -154,6 +152,19 @@ app.get('/api/vendors/:vendorId/profile', async (req, res) => {
       }
     });
     
+    // 🛡️ THE SAFETY NET: If the user doesn't exist yet, build their profile right now!
+    if (!vendor && req.params.vendorId.startsWith('user_')) {
+      console.log(`[SAFETY NET] Creating missing profile for ${req.params.vendorId}`);
+      vendor = await prisma.vendor.create({
+        data: {
+          clerkId: req.params.vendorId,
+          name: "My Restaurant", // Default name
+          businessType: "Street Stall",
+          email: `${req.params.vendorId}@pending-setup.com`
+        }
+      });
+    }
+
     if (!vendor) return res.status(404).json({ error: 'Vendor profile not found' });
     
     res.json(vendor);
