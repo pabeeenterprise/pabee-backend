@@ -124,23 +124,7 @@ seedDatabase();
 
 // --- ⚙️ SETTINGS & PROFILE ROUTES ---
 
-// 1. Get Vendor Profile
-app.get('/api/vendors/:vendorId/profile', async (req, res) => {
-  try {
-    // We search by clerkId since that is what the frontend Auth context provides
-    const vendor = await prisma.vendor.findUnique({
-      where: { clerkId: req.params.vendorId }
-    });
-    
-    if (!vendor) return res.status(404).json({ error: 'Vendor profile not found' });
-    
-    res.json(vendor);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch vendor profile' });
-  }
-});
-
-// 2. Get Vendor Profile (SMART ROUTE WITH SAFETY NET)
+// 1. Get Vendor Profile (SMART ROUTE WITH SAFETY NET)
 app.get('/api/vendors/:vendorId/profile', async (req, res) => {
   try {
     let vendor = await prisma.vendor.findFirst({
