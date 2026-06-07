@@ -43,6 +43,7 @@ model MenuItem {
   prep        String   
   veg         Boolean  @default(true)
   available   Boolean  @default(true)
+  imageUrl  String?
 }
 
 model Order {
