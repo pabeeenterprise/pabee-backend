@@ -124,7 +124,7 @@ seedDatabase();
 
 // --- ⚙️ SETTINGS & PROFILE ROUTES ---
 
-// 1. Get Vendor Profile (SMART ROUTE WITH SAFETY NET)
+// 1. Get Vendor Profile (Smart Route + Safety Net)
 app.get('/api/vendors/:vendorId/profile', async (req, res) => {
   try {
     let vendor = await prisma.vendor.findFirst({
@@ -136,25 +136,48 @@ app.get('/api/vendors/:vendorId/profile', async (req, res) => {
       }
     });
     
-    // 🛡️ THE SAFETY NET: If the user doesn't exist yet, build their profile right now!
     if (!vendor && req.params.vendorId.startsWith('user_')) {
-      console.log(`[SAFETY NET] Creating missing profile for ${req.params.vendorId}`);
       vendor = await prisma.vendor.create({
         data: {
           clerkId: req.params.vendorId,
-          name: "My Restaurant", // Default name
+          name: "My Restaurant", 
           businessType: "Street Stall",
-          email: `${req.params.vendorId}@pending-setup.com`
+          email: `${req.params.vendorId}@pending-setup.com` 
         }
       });
     }
 
     if (!vendor) return res.status(404).json({ error: 'Vendor profile not found' });
-    
     res.json(vendor);
   } catch (error) {
-    console.error("Error fetching vendor profile:", error);
     res.status(500).json({ error: 'Failed to fetch vendor profile' });
+  }
+});
+
+// 2. Update Vendor Profile (Settings Page)
+app.patch('/api/vendors/:vendorId/profile', async (req, res) => {
+  try {
+    const { name, businessType } = req.body;
+    
+    const vendor = await prisma.vendor.findFirst({
+      where: {
+        OR: [
+          { clerkId: req.params.vendorId },
+          { id: req.params.vendorId }
+        ]
+      }
+    });
+
+    if (!vendor) return res.status(404).json({ error: 'Vendor not found' });
+
+    const updatedVendor = await prisma.vendor.update({
+      where: { id: vendor.id },
+      data: { name, businessType }
+    });
+
+    res.json(updatedVendor);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update store profile' });
   }
 });
 
