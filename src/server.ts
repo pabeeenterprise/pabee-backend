@@ -724,5 +724,19 @@ app.patch('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
   }
 });
 
+// --- 🚨 GLOBAL ERROR CATCHER ---
+// Place this right before app.listen()
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error("🔥 Server Error:", err.message || err);
+  
+  // If it's a Clerk authentication error, tell the frontend it was unauthorized
+  if (err.message === 'Unauthenticated' || err.message.includes('token')) {
+    return res.status(401).json({ error: 'Unauthorized: Invalid or expired session token' });
+  }
+
+  // Otherwise, send a generic 500 but log the real error to Render
+  res.status(500).json({ error: 'Internal Server Error', details: err.message });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Pabee Backend running on port ${PORT}`));
