@@ -364,7 +364,8 @@ app.get('/api/vendors/:vendorId/analytics', requireAuth, async (req, res) => {
     const orders = await prisma.order.findMany({
       where: {
         vendorId: req.params.vendorId as string,
-        createdAt: { gte: thirtyDaysAgo }
+        createdAt: { gte: thirtyDaysAgo},
+        kitchenStatus: 'completed'
       },
       include: {
         items: true 
@@ -722,20 +723,6 @@ app.patch('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
     console.error("Branding update error:", error);
     res.status(500).json({ error: 'Failed to update branding settings' });
   }
-});
-
-// --- 🚨 GLOBAL ERROR CATCHER ---
-// Place this right before app.listen()
-app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  console.error("🔥 Server Error:", err.message || err);
-  
-  // If it's a Clerk authentication error, tell the frontend it was unauthorized
-  if (err.message === 'Unauthenticated' || err.message.includes('token')) {
-    return res.status(401).json({ error: 'Unauthorized: Invalid or expired session token' });
-  }
-
-  // Otherwise, send a generic 500 but log the real error to Render
-  res.status(500).json({ error: 'Internal Server Error', details: err.message });
 });
 
 const PORT = process.env.PORT || 3000;
