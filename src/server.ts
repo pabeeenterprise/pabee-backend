@@ -4,6 +4,7 @@ import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
 import Razorpay from 'razorpay';
 import { Webhook } from 'svix';
+import { ClerkExpressRequireAuth } from '@clerk/clerk-sdk-node';
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_1234567890abcd',
@@ -11,6 +12,7 @@ const razorpay = new Razorpay({
 });
 const prisma = new PrismaClient();
 const app = express();
+const requireAuth = ClerkExpressRequireAuth({}) as unknown as express.RequestHandler;
 
 app.use(cors({
   origin: [
@@ -155,15 +157,15 @@ app.get('/api/vendors/:vendorId/profile', async (req, res) => {
 });
 
 // 2. Update Vendor Profile (Settings Page)
-app.patch('/api/vendors/:vendorId/profile', async (req, res) => {
+app.patch('/api/vendors/:vendorId/profile', requireAuth, async (req, res) => {
   try {
     const { name, businessType } = req.body;
     
     const vendor = await prisma.vendor.findFirst({
       where: {
         OR: [
-          { clerkId: req.params.vendorId },
-          { id: req.params.vendorId }
+          { clerkId: req.params.vendorId as string },
+          { id: req.params.vendorId as string }
         ]
       }
     });
@@ -199,7 +201,7 @@ app.get('/api/vendors/:vendorId/menu', async (req, res) => {
 app.get('/api/vendors/:vendorId/menu-editor', async (req, res) => {
   try {
     const items = await prisma.menuItem.findMany({ 
-      where: { vendorId: req.params.vendorId },
+      where: { vendorId: req.params.vendorId as string },
       orderBy: { category: 'asc' }
     });
     res.json({ items });
@@ -209,13 +211,13 @@ app.get('/api/vendors/:vendorId/menu-editor', async (req, res) => {
 });
 
 // 1.2 Add New Item
-app.post('/api/vendors/:vendorId/menu', async (req, res) => {
+app.post('/api/vendors/:vendorId/menu', requireAuth, async (req, res) => {
   try {
-    const { name, category, price, prep, veg, available } = req.body;
+    const { name, category, price, prep, veg, available, imageUrl} = req.body;
     const newItem = await prisma.menuItem.create({
       data: {
-        vendorId: req.params.vendorId,
-        name, category, price: Number(price), prep: prep || '10 min', veg, available
+        vendorId: req.params.vendorId as string,
+        name, category, price: Number(price), prep: prep || '10 min', veg, available, imageUrl
       }
     });
     res.json(newItem);
@@ -225,10 +227,10 @@ app.post('/api/vendors/:vendorId/menu', async (req, res) => {
 });
 
 // 1.3 Update Item (Edit details or toggle In-Stock/Out-of-Stock)
-app.patch('/api/vendors/:vendorId/menu/:itemId', async (req, res) => {
+app.patch('/api/vendors/:vendorId/menu/:itemId', requireAuth, async (req, res) => {
   try {
     const updatedItem = await prisma.menuItem.update({
-      where: { id: req.params.itemId },
+      where: { id: req.params.itemId as string },
       data: req.body // Prisma is smart enough to only update the fields provided
     });
     res.json(updatedItem);
@@ -238,9 +240,9 @@ app.patch('/api/vendors/:vendorId/menu/:itemId', async (req, res) => {
 });
 
 // 1.4 Delete Item
-app.delete('/api/vendors/:vendorId/menu/:itemId', async (req, res) => {
+app.delete('/api/vendors/:vendorId/menu/:itemId', requireAuth, async (req, res) => {
   try {
-    await prisma.menuItem.delete({ where: { id: req.params.itemId } });
+    await prisma.menuItem.delete({ where: { id: req.params.itemId as string } });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete item' });
@@ -254,7 +256,7 @@ app.delete('/api/vendors/:vendorId/menu/:itemId', async (req, res) => {
 app.get('/api/vendors/:vendorId/promos', async (req, res) => {
   try {
     const promos = await prisma.promo.findMany({
-      where: { vendorId: req.params.vendorId },
+      where: { vendorId: req.params.vendorId as string },
       orderBy: { createdAt: 'desc' }
     });
     res.json({ promos });
@@ -264,13 +266,13 @@ app.get('/api/vendors/:vendorId/promos', async (req, res) => {
 });
 
 // 2. Create a new promo
-app.post('/api/vendors/:vendorId/promos', async (req, res) => {
+app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
   try {
     const { code, type, value, minOrderValue, maxUses, expiresAt, isActive } = req.body;
     
     const newPromo = await prisma.promo.create({
       data: {
-        vendorId: req.params.vendorId,
+        vendorId: req.params.vendorId as string,
         code: code.toUpperCase(), // Always force uppercase!
         type,
         value: Number(value),
@@ -289,7 +291,7 @@ app.post('/api/vendors/:vendorId/promos', async (req, res) => {
 // 3. Delete a promo
 app.delete('/api/vendors/:vendorId/promos/:promoId', async (req, res) => {
   try {
-    await prisma.promo.delete({ where: { id: req.params.promoId } });
+    await prisma.promo.delete({ where: { id: req.params.promoId as string } });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete promo' });
@@ -304,7 +306,7 @@ app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
     // Find the promo
     const promo = await prisma.promo.findUnique({
       where: {
-        vendorId_code: { vendorId: req.params.vendorId, code: code.toUpperCase() }
+        vendorId_code: { vendorId: req.params.vendorId as string, code: code.toUpperCase() }
       }
     });
 
@@ -352,7 +354,7 @@ app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
 });
 
 // --- 📊 ADVANCED ANALYTICS ROUTE (TypeScript Safe!) ---
-app.get('/api/vendors/:vendorId/analytics', async (req, res) => {
+app.get('/api/vendors/:vendorId/analytics', requireAuth, async (req, res) => {
   try {
     const today = new Date();
     const thirtyDaysAgo = new Date();
@@ -361,7 +363,7 @@ app.get('/api/vendors/:vendorId/analytics', async (req, res) => {
     // FIX 1: Add include: { items: true } so Prisma actually fetches the food items!
     const orders = await prisma.order.findMany({
       where: {
-        vendorId: req.params.vendorId,
+        vendorId: req.params.vendorId as string,
         createdAt: { gte: thirtyDaysAgo }
       },
       include: {
@@ -534,12 +536,12 @@ app.get('/api/vendors/:vendorId/kitchen-queue', async (req, res) => {
 });
 
 // 4. Update Kitchen Status
-app.patch('/api/orders/:orderId/kitchen-status', async (req, res) => {
+app.patch('/api/orders/:orderId/kitchen-status', requireAuth, async (req, res) => {
   const { orderId } = req.params;
   const { status } = req.body;
   try {
     const order = await prisma.order.update({
-      where: { id: orderId },
+      where: { id: orderId as string },
       data: { kitchenStatus: status }
     });
     res.json(order);
@@ -554,7 +556,7 @@ app.get('/api/orders/:orderId/status', async (req, res) => {
   const { orderId } = req.params;
   try {
     const order = await prisma.order.findUnique({ 
-      where: { id: orderId },
+      where: { id: orderId as string },
       select: { id: true, kitchenStatus: true } // We only need the status
     });
     
@@ -700,12 +702,12 @@ app.post('/api/razorpay/create-order', async (req, res) => {
 
 // --- 🎨 BRANDING STUDIO ROUTE ---
 
-app.patch('/api/vendors/:vendorId/branding', async (req, res) => {
+app.patch('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
   try {
     const { primaryColor, theme, logoUrl, bannerUrl } = req.body;
     
     const updatedVendor = await prisma.vendor.update({
-      where: { clerkId: req.params.vendorId },
+      where: { clerkId: req.params.vendorId as string },
       data: { 
         primaryColor, 
         theme,
