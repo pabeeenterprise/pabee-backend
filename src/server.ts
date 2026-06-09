@@ -238,23 +238,36 @@ app.get('/api/vendors/:vendorId/payment', requireAuth, async (req, res) => {
 // 3. Retrieve Public Payment Profile (For Customer Checkout)
 app.get('/api/vendors/:vendorId/payment/public', async (req, res) => {
   try {
-    const paymentData = await prisma.paymentData.findUnique({
-      where: { vendorId: req.params.vendorId as string }
+    const vendor = await prisma.vendor.findFirst({
+      where: {
+        OR: [
+          { clerkId: req.params.vendorId as string },
+          { id: req.params.vendorId as string }
+        ]
+      },
+      include: {
+        paymentData: true 
+      }
     });
 
-    // If the vendor hasn't set it up, or toggled it off, tell the frontend it's unavailable
-    if (!paymentData || !paymentData.isActive) {
+    // 🛡️ THE FIX: Extract the first payment profile from the array
+    const rawPaymentData = vendor?.paymentData;
+    const activePaymentConfig = Array.isArray(rawPaymentData) ? rawPaymentData[0] : rawPaymentData;
+
+    // If no payment data exists in the array, or the toggle is off -> Disable UPI
+    if (!activePaymentConfig || !activePaymentConfig.isActive) {
       return res.json({ available: false });
     }
 
-    const decryptedUpi = decrypt(paymentData.upiId);
+    const decryptedUpi = decrypt(activePaymentConfig.upiId);
 
     res.json({ 
       available: true,
       upiId: decryptedUpi, 
-      qrImagePath: paymentData.qrImagePath 
+      qrImagePath: activePaymentConfig.qrImagePath 
     });
   } catch (error) {
+    console.error("Public Payment Error:", error);
     res.status(500).json({ error: 'Failed to retrieve public payment data' });
   }
 });
