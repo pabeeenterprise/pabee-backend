@@ -1,15 +1,11 @@
+import { encrypt, decrypt } from './utils/encryption'; // Ensure this is at the top!
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
-import Razorpay from 'razorpay';
 import { Webhook } from 'svix';
 import { ClerkExpressRequireAuth } from '@clerk/clerk-sdk-node';
 
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_1234567890abcd',
-  key_secret: process.env.RAZORPAY_KEY_SECRET || '1234567890abcdef1234567890abcdef',
-});
 const prisma = new PrismaClient();
 const app = express();
 const requireAuth = ClerkExpressRequireAuth({}) as unknown as express.RequestHandler;
@@ -182,6 +178,64 @@ app.patch('/api/vendors/:vendorId/profile', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Failed to update store profile' });
   }
 });
+
+// --- 💳 PAYMENT DATA ROUTES ---
+
+// 1. Save or Update Payment Profile
+app.post('/api/vendors/:vendorId/payment', requireAuth, async (req, res) => {
+  try {
+    const { upiId, qrImagePath, isActive } = req.body;
+    if (!upiId) return res.status(400).json({ error: "upiId is required" });
+
+    const encryptedUpi = encrypt(upiId);
+
+    const paymentData = await prisma.paymentData.upsert({
+      where: { vendorId: req.params.vendorId as string },
+      update: { 
+        upiId: encryptedUpi,
+        ...(qrImagePath !== undefined && { qrImagePath }),
+        ...(isActive !== undefined && { isActive })
+      },
+      create: {
+        vendorId: req.params.vendorId as string,
+        upiId: encryptedUpi,
+        qrImagePath: qrImagePath || null,
+        isActive: isActive !== undefined ? isActive : true
+      }
+    });
+
+    res.json({ success: true, message: "Payment data secured." });
+  } catch (error) {
+    console.error("Payment Error:", error);
+    res.status(500).json({ error: 'Failed to save payment data' });
+  }
+});
+
+// 2. Retrieve Decrypted Payment Profile
+app.get('/api/vendors/:vendorId/payment', requireAuth, async (req, res) => {
+  try {
+    const paymentData = await prisma.paymentData.findUnique({
+      where: { vendorId: req.params.vendorId as string }
+    });
+
+    if (!paymentData) {
+      return res.status(404).json({ error: "No payment method found" });
+    }
+
+    const decryptedUpi = decrypt(paymentData.upiId);
+
+    res.json({ 
+      upiId: decryptedUpi, 
+      qrImagePath: paymentData.qrImagePath,
+      isActive: paymentData.isActive,
+      paymentType: paymentData.paymentType
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to retrieve payment data' });
+  }
+});
+
+// --------------------------------
 
 // 1. Fetch Menu (Customer View)
 app.get('/api/vendors/:vendorId/menu', async (req, res) => {
@@ -662,12 +716,12 @@ app.post('/api/otp/verify', async (req, res) => {
 });
 
 // 7. Get Vendor Sales Dashboard Data
-app.get('/api/vendors/:vendorId/sales', async (req, res) => {
+app.get('/api/vendors/:vendorId/sales', requireAuth, async (req, res) => {
   const { vendorId } = req.params;
   try {
     // Fetch all completed orders
     const orders = await prisma.order.findMany({
-      where: { vendorId, kitchenStatus: 'completed' },
+      where: { vendorId: vendorId as string, kitchenStatus: 'completed' },
       include: { items: true }, // 👈 CRUCIAL: Include the items for the "Top Selling" calculation!
       orderBy: { createdAt: 'desc' }, // Newest first
     });
@@ -678,26 +732,6 @@ app.get('/api/vendors/:vendorId/sales', async (req, res) => {
   } catch (error) {
     console.error("Sales Endpoint Error:", error);
     res.status(500).json({ error: 'Failed to fetch sales data' });
-  }
-});
-
-
-
-app.post('/api/razorpay/create-order', async (req, res) => {
-  try {
-    const { amount } = req.body;
-
-    const options = {
-      amount: amount * 100, // Razorpay expects amount in paise (₹1 = 100 paise)
-      currency: "INR",
-      receipt: `receipt_${Math.floor(Math.random() * 10000)}`,
-    };
-
-    const order = await razorpay.orders.create(options);
-    res.json(order);
-  } catch (error) {
-    console.error("Razorpay Error:", error);
-    res.status(500).json({ error: "Failed to create Razorpay order" });
   }
 });
 
@@ -723,6 +757,17 @@ app.patch('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
     console.error("Branding update error:", error);
     res.status(500).json({ error: 'Failed to update branding settings' });
   }
+});
+
+// --- 🚨 GLOBAL ERROR CATCHER ---
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error("🔥 Server Error:", err.message || err);
+  
+  if (err.message === 'Unauthenticated' || err.message.includes('token')) {
+    return res.status(401).json({ error: 'Unauthorized: Invalid or expired session token' });
+  }
+
+  res.status(500).json({ error: 'Internal Server Error', details: err.message });
 });
 
 const PORT = process.env.PORT || 3000;

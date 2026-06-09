@@ -37,7 +37,7 @@ model Vendor {
 
 model PaymentData {
   id          String      @id @default(uuid())
-  vendorId    String
+  vendorId    String      @unique
   vendor      Vendor      @relation(fields: [vendorId], references: [id], onDelete: Cascade)
 
   upiId       String
@@ -48,8 +48,6 @@ model PaymentData {
 
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
-
-  @@index([vendorId])
 }
 
 enum PaymentType {
