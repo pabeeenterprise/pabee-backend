@@ -235,6 +235,29 @@ app.get('/api/vendors/:vendorId/payment', requireAuth, async (req, res) => {
   }
 });
 
+// 3. Retrieve Public Payment Profile (For Customer Checkout)
+app.get('/api/vendors/:vendorId/payment/public', async (req, res) => {
+  try {
+    const paymentData = await prisma.paymentData.findUnique({
+      where: { vendorId: req.params.vendorId as string }
+    });
+
+    // If the vendor hasn't set it up, or toggled it off, tell the frontend it's unavailable
+    if (!paymentData || !paymentData.isActive) {
+      return res.json({ available: false });
+    }
+
+    const decryptedUpi = decrypt(paymentData.upiId);
+
+    res.json({ 
+      available: true,
+      upiId: decryptedUpi, 
+      qrImagePath: paymentData.qrImagePath 
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to retrieve public payment data' });
+  }
+});
 // --------------------------------
 
 // 1. Fetch Menu (Customer View)
