@@ -771,27 +771,84 @@ app.get('/api/vendors/:vendorId/sales', requireAuth, async (req, res) => {
   }
 });
 
-// --- 🎨 BRANDING STUDIO ROUTE ---
+// --- 🎨 BRANDING STUDIO ROUTES ---
+
+app.get('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
+  // 🛡️ THE FIX FOR 2322: Strictly cast to a primitive string
+  const vendorId = String(req.params.vendorId);
+
+  try {
+    const vendor = await prisma.vendor.findFirst({
+      where: {
+        OR: [
+          { clerkId: vendorId },
+          { id: vendorId }
+        ]
+      }
+    });
+
+    if (!vendor) return res.status(404).json({ error: 'Vendor profile not found' });
+
+    return res.status(200).json({
+      storeName: vendor.name || 'Your Store',
+      branding: {
+        themeMode: vendor.themeMode, 
+        accentColor: vendor.accentColor, 
+        fontFamily: vendor.fontFamily,
+        buttonRoundness: vendor.buttonRoundness,
+        logoUrl: vendor.logoUrl, 
+        bannerUrl: vendor.bannerUrl 
+      }
+    });
+  } catch (error) {
+    console.error("Branding query failed:", error);
+    return res.status(500).json({ error: 'Internal server failure' });
+  }
+});
 
 app.patch('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
+  // 🛡️ THE FIX FOR 2322: Strictly cast to a primitive string
+  const vendorId = String(req.params.vendorId);
+  const { themeMode, accentColor, fontFamily, buttonRoundness, logoUrl, bannerUrl } = req.body;
+
   try {
-    const { primaryColor, theme, logoUrl, bannerUrl } = req.body;
-    
+    const vendor = await prisma.vendor.findFirst({
+      where: {
+        OR: [
+          { clerkId: vendorId },
+          { id: vendorId }
+        ]
+      }
+    });
+
+    if (!vendor) return res.status(404).json({ error: 'Vendor not found' });
+
     const updatedVendor = await prisma.vendor.update({
-      where: { clerkId: req.params.vendorId as string },
+      where: { id: vendor.id }, 
       data: { 
-        primaryColor, 
-        theme,
-        // Only update URLs if they were actually provided
-        ...(logoUrl && { logoUrl }),
-        ...(bannerUrl && { bannerUrl })
+        themeMode, 
+        accentColor, 
+        fontFamily,
+        buttonRoundness,
+        ...(logoUrl && { logoUrl }), 
+        ...(bannerUrl && { bannerUrl }) 
       }
     });
     
-    res.json(updatedVendor);
+    return res.status(200).json({
+      success: true,
+      branding: {
+        themeMode: updatedVendor.themeMode, 
+        accentColor: updatedVendor.accentColor, 
+        fontFamily: updatedVendor.fontFamily,
+        buttonRoundness: updatedVendor.buttonRoundness,
+        logoUrl: updatedVendor.logoUrl, 
+        bannerUrl: updatedVendor.bannerUrl 
+      }
+    });
   } catch (error) {
-    console.error("Branding update error:", error);
-    res.status(500).json({ error: 'Failed to update branding settings' });
+    console.error("Branding update failed:", error);
+    return res.status(500).json({ error: 'Failed to update branding settings' });
   }
 });
 

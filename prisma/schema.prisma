@@ -9,30 +9,29 @@ datasource db {
 }
 
 model Vendor {
-  id           String     @id @default(uuid())
-  clerkId      String     @unique  // 👈 ADDED: Links DB to the Clerk user
-  email        String     @unique  // 👈 ADDED: Stores their Google/Sign-up email
+  id           String   @id @default(uuid())
+  clerkId      String   @unique  // Links DB to the Clerk user
+  email        String   @unique  // Stores their Google/Sign-up email
 
   name         String?
   businessType String?    
 
-
   tier         Int        @default(1)
   defaultTable String     @default("Counter")
 
-  // --- BRANDING STUDIO FIELDS ---
-  logoUrl      String?    // Optional: URL for their uploaded logo
-  bannerUrl    String?    // Optional: URL for the top banner image
-  primaryColor String     @default("#E5B35C") // Defaults to Pabee Gold
-  theme        String     @default("dark")    // "dark" or "light"
+  // --- 🌟 UPDATED BRANDING STUDIO FIELDS ---
+  logoUrl         String?    // Optional: URL for their uploaded logo
+  bannerUrl       String?    // Optional: URL for the top banner image
+  accentColor     String     @default("#E5B35C") // 👈 Changed from primaryColor to match frontend
+  themeMode       String     @default("dark")    // 👈 Changed from theme to match frontend
+  fontFamily      String     @default("font-sans")    // 👈 ADDED NEW
+  buttonRoundness String     @default("rounded-xl")   // 👈 ADDED NEW
 
-  // ... (keep your existing relations like menus, orders, etc.)
-  
+  // --- RELATIONS ---
   menuItems    MenuItem[]
   orders       Order[]
   promos       Promo[]
-
-    paymentData  PaymentData[]
+  paymentData  PaymentData[]
 }
 
 model PaymentData {
