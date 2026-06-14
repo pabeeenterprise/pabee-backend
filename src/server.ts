@@ -288,47 +288,45 @@ app.get('/api/vendors/:vendorId/menu', async (req, res) => {
 // --- MENU EDITOR ROUTES ---
 
 // 1.1 Get ALL Menu Items (Including hidden ones for the Editor)
+// 1. THE BULLETPROOF GET ROUTE
 app.get('/api/vendors/:vendorId/menu-editor', async (req, res) => {
   try {
-    const clerkId = req.params.vendorId;
+    const idParam = req.params.vendorId;
+    let dbVendorId = idParam;
 
-    // 1. Find the real Postgres UUID using the Clerk ID
-    const vendor = await prisma.vendor.findUnique({
-      where: { clerkId: clerkId }
-    });
-
-    if (!vendor) {
-      return res.status(404).json({ error: "Vendor account not found." });
+    // If the frontend passes a Clerk ID (starts with user_), translate it.
+    if (idParam.startsWith('user_')) {
+      const vendor = await prisma.vendor.findUnique({ where: { clerkId: idParam } });
+      if (!vendor) return res.status(404).json({ error: "Vendor not found." });
+      dbVendorId = vendor.id;
     }
 
-    // 2. Fetch the items using the real database ID (vendor.id)
+    // Fetch using the true Postgres UUID
     const items = await prisma.menuItem.findMany({ 
-      where: { vendorId: vendor.id }, // 👈 THE CRITICAL FIX
+      where: { vendorId: dbVendorId },
       orderBy: { category: 'asc' }
     });
     
     res.json({ items });
   } catch (error) {
     console.error("🚨 FETCH MENU ERROR:", error);
-    res.status(500).json({ error: 'Failed to fetch menu for editor' });
+    res.status(500).json({ error: 'Failed to fetch menu' });
   }
 });
 
-// 1.2 Add New Item
+// 2. THE BULLETPROOF POST ROUTE
 app.post('/api/vendors/:vendorId/menu', async (req, res) => {
   try {
-    const clerkId = req.params.vendorId;
+    const idParam = req.params.vendorId;
+    let dbVendorId = idParam;
 
-    // 1. CRITICAL STEP: Find the real Postgres UUID using the Clerk ID
-    const vendor = await prisma.vendor.findUnique({
-      where: { clerkId: clerkId }
-    });
-
-    if (!vendor) {
-      return res.status(404).json({ error: "Vendor account not found in database." });
+    // If the frontend passes a Clerk ID, translate it.
+    if (idParam.startsWith('user_')) {
+      const vendor = await prisma.vendor.findUnique({ where: { clerkId: idParam } });
+      if (!vendor) return res.status(404).json({ error: "Vendor not found." });
+      dbVendorId = vendor.id;
     }
 
-    // 2. Create the item using the REAL database ID (vendor.id)
     const newItem = await prisma.menuItem.create({
       data: {
         name: req.body.name,
@@ -338,24 +336,17 @@ app.post('/api/vendors/:vendorId/menu', async (req, res) => {
         veg: req.body.veg,
         available: req.body.available,
         imageUrl: req.body.imageUrl || null,
-        
-        // 🌟 Your new configuration fields
         description: req.body.description || null,
         costPrice: req.body.costPrice ? Number(req.body.costPrice) : null,
         emoji: req.body.emoji || null,
         remarks: req.body.remarks || null,
         badgeLabel: req.body.badgeLabel || null,
-        
-        // THE FIX: Use the Postgres ID, not the Clerk ID
-        vendorId: vendor.id 
+        vendorId: dbVendorId // 👈 Now uses the correct database UUID guaranteed
       }
     });
 
-    // 3. Send success back to React
     res.status(201).json(newItem);
-
   } catch (error) {
-    // 4. NEVER HIDE ERRORS AGAIN: Print them to the backend terminal
     console.error("🚨 DATABASE CREATION FAILED:", error);
     res.status(500).json({ error: "Failed to save to database" });
   }
