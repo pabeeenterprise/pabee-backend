@@ -116,6 +116,8 @@ model Promo {
   expiresAt     DateTime? // Null means it never expires.
   isActive      Boolean   @default(true)
   createdAt     DateTime  @default(now())
+  // 🌟 THE DROPDOWN TARGET
+  applyTo       String    @default("ALL") // Stores "ALL" or a specific category like "Chaat"
 
   vendor        Vendor    @relation(fields: [vendorId], references: [id])
 

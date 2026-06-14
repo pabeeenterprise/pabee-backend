@@ -378,11 +378,23 @@ app.delete('/api/vendors/:vendorId/menu/:itemId', requireAuth, async (req, res) 
 
 // --- 🎟️ OFFERS & PROMOS ROUTES ---
 
-// 1. Get all promos (For Vendor Dashboard)
+// Helper function to safely get the true Postgres Database ID
+async function getDbVendorId(idParam) {
+  if (idParam.startsWith('user_')) {
+    const vendor = await prisma.vendor.findUnique({ where: { clerkId: idParam } });
+    return vendor ? vendor.id : null;
+  }
+  return idParam;
+}
+
+// 1. Get all promos
 app.get('/api/vendors/:vendorId/promos', async (req, res) => {
   try {
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+
     const promos = await prisma.promo.findMany({
-      where: { vendorId: req.params.vendorId as string },
+      where: { vendorId: dbVendorId },
       orderBy: { createdAt: 'desc' }
     });
     res.json({ promos });
@@ -394,22 +406,27 @@ app.get('/api/vendors/:vendorId/promos', async (req, res) => {
 // 2. Create a new promo
 app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
   try {
-    const { code, type, value, minOrderValue, maxUses, expiresAt, isActive } = req.body;
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+
+    const { code, type, value, minOrderValue, maxUses, expiresAt, isActive, applyTo } = req.body;
     
     const newPromo = await prisma.promo.create({
       data: {
-        vendorId: req.params.vendorId as string,
-        code: code.toUpperCase(), // Always force uppercase!
+        vendorId: dbVendorId,
+        code: code.toUpperCase(),
         type,
         value: Number(value),
         minOrderValue: Number(minOrderValue || 0),
         maxUses: maxUses ? Number(maxUses) : null,
         expiresAt: expiresAt ? new Date(expiresAt) : null,
-        isActive
+        isActive,
+        applyTo: applyTo || "ALL" // 👈 SAVES THE CATEGORY TARGET
       }
     });
     res.json(newPromo);
   } catch (error) {
+    console.error(error);
     res.status(500).json({ error: 'Failed to create promo. Code might already exist.' });
   }
 });
@@ -417,55 +434,55 @@ app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
 // 3. Delete a promo
 app.delete('/api/vendors/:vendorId/promos/:promoId', async (req, res) => {
   try {
-    await prisma.promo.delete({ where: { id: req.params.promoId as string } });
+    await prisma.promo.delete({ where: { id: req.params.promoId } });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete promo' });
   }
 });
 
-// 4. 🛑 VERIFY A PROMO (For Customer Checkout) - THE IMPORTANT MATH!
+// 4. 🛑 VERIFY A PROMO (THE ADVANCED CHECKOUT MATH)
 app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
   try {
-    const { code, cartTotal } = req.body;
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+
+    // 🌟 CHANGED: We now require the full cart array to check categories
+    const { code, cartItems } = req.body; 
     
-    // Find the promo
-    const promo = await prisma.promo.findUnique({
-      where: {
-        vendorId_code: { vendorId: req.params.vendorId as string, code: code.toUpperCase() }
-      }
+    // Calculate total cart value
+    const cartTotal = cartItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+
+    const promo = await prisma.promo.findFirst({
+      where: { vendorId: dbVendorId, code: code.toUpperCase() }
     });
 
-    // Rule 1: Does it exist and is it turned on?
-    if (!promo || !promo.isActive) {
-      return res.status(400).json({ error: 'Invalid or inactive promo code.' });
+    if (!promo || !promo.isActive) return res.status(400).json({ error: 'Invalid or inactive promo code.' });
+    if (cartTotal < promo.minOrderValue) return res.status(400).json({ error: `Cart must be at least ₹${promo.minOrderValue}.` });
+    if (promo.expiresAt && new Date() > promo.expiresAt) return res.status(400).json({ error: 'This promo code has expired.' });
+    if (promo.maxUses !== null && promo.currentUses >= promo.maxUses) return res.status(400).json({ error: 'Usage limit reached.' });
+
+    // 🌟 THE NEW CATEGORY FILTER MATH
+    let eligibleTotal = cartTotal;
+
+    if (promo.applyTo !== "ALL") {
+      // Sum up ONLY the items that match the target category (e.g., "Chaat")
+      eligibleTotal = cartItems
+        .filter(item => item.category === promo.applyTo)
+        .reduce((sum, item) => sum + (item.price * item.quantity), 0);
+
+      if (eligibleTotal === 0) {
+        return res.status(400).json({ error: `This code only applies to items in the ${promo.applyTo} category.` });
+      }
     }
 
-    // Rule 2: Did they spend enough?
-    if (cartTotal < promo.minOrderValue) {
-      return res.status(400).json({ error: `Cart must be at least ₹${promo.minOrderValue} to use this code.` });
-    }
-
-    // Rule 3: Is it expired?
-    if (promo.expiresAt && new Date() > promo.expiresAt) {
-      return res.status(400).json({ error: 'This promo code has expired.' });
-    }
-
-    // Rule 4: Has it been used too many times?
-    if (promo.maxUses !== null && promo.currentUses >= promo.maxUses) {
-      return res.status(400).json({ error: 'This promo code has reached its usage limit.' });
-    }
-
-    // If it passes all rules, calculate the discount!
+    // Calculate discount against the ELIGIBLE total, not the whole cart
     let discountAmount = 0;
     if (promo.type === 'FLAT') {
-      discountAmount = promo.value;
-    } else if (promo.type === 'PERCENTAGE') {
-      discountAmount = (cartTotal * promo.value) / 100;
+      discountAmount = Math.min(promo.value, eligibleTotal); // Don't discount more than the eligible items cost
+    } else if (promo.type === 'PERCENTAGE' || promo.type === 'Percentage discount (%)') {
+      discountAmount = (eligibleTotal * promo.value) / 100;
     }
-
-    // Don't let the discount be more than the cart total itself!
-    if (discountAmount > cartTotal) discountAmount = cartTotal;
 
     res.json({ 
       success: true, 
@@ -475,6 +492,7 @@ app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
     });
 
   } catch (error) {
+    console.error("Verification error:", error);
     res.status(500).json({ error: 'Failed to verify promo.' });
   }
 });
