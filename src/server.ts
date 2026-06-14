@@ -843,7 +843,8 @@ app.get('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
 
 app.patch('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
   const vendorId = String(req.params.vendorId);
-  const { themeMode, accentColor, fontFamily, buttonRoundness, logoUrl, bannerUrl } = req.body;
+  // 1. EXTRACT NEW FIELDS
+  const { themeMode, accentColor, fontFamily, buttonRoundness, logoUrl, bannerUrl, showOfferStrip, offerText } = req.body;
 
   try {
     const vendor = await prisma.vendor.findFirst({
@@ -864,9 +865,11 @@ app.patch('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
         accentColor, 
         fontFamily,
         buttonRoundness,
+        showOfferStrip, // 2. SAVE TO DB
+        offerText,      // 2. SAVE TO DB
         ...(logoUrl && { logoUrl }), 
         ...(bannerUrl && { bannerUrl }) 
-      } as any // 🛡️ NUCLEAR BYPASS: Forces TypeScript to ignore the local ghost cache
+      } as any 
     });
     
     return res.status(200).json({
@@ -876,6 +879,8 @@ app.patch('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
         accentColor: (updatedVendor as any).accentColor, 
         fontFamily: (updatedVendor as any).fontFamily,
         buttonRoundness: (updatedVendor as any).buttonRoundness,
+        showOfferStrip: (updatedVendor as any).showOfferStrip, // 3. RETURN TO UI
+        offerText: (updatedVendor as any).offerText,           // 3. RETURN TO UI
         logoUrl: updatedVendor.logoUrl, 
         bannerUrl: updatedVendor.bannerUrl 
       }
