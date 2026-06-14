@@ -303,11 +303,13 @@ app.get('/api/vendors/:vendorId/menu-editor', async (req, res) => {
 // 1.2 Add New Item
 app.post('/api/vendors/:vendorId/menu', requireAuth, async (req, res) => {
   try {
-    const { name, category, price, prep, veg, available, imageUrl} = req.body;
+    const { name, category, price, prep, veg, available, imageUrl, description, costPrice, remark} = req.body;
     const newItem = await prisma.menuItem.create({
       data: {
         vendorId: req.params.vendorId as string,
-        name, category, price: Number(price), prep: prep || '10 min', veg, available, imageUrl
+        name, category, price: Number(price), prep: prep || '10 min', veg, available, imageUrl, description,
+        costPrice: costPrice ? parseFloat(costPrice) : null,
+        remarks: req.body.remarks
       }
     });
     res.json(newItem);
