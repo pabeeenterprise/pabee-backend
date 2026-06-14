@@ -290,31 +290,74 @@ app.get('/api/vendors/:vendorId/menu', async (req, res) => {
 // 1.1 Get ALL Menu Items (Including hidden ones for the Editor)
 app.get('/api/vendors/:vendorId/menu-editor', async (req, res) => {
   try {
+    const clerkId = req.params.vendorId;
+
+    // 1. Find the real Postgres UUID using the Clerk ID
+    const vendor = await prisma.vendor.findUnique({
+      where: { clerkId: clerkId }
+    });
+
+    if (!vendor) {
+      return res.status(404).json({ error: "Vendor account not found." });
+    }
+
+    // 2. Fetch the items using the real database ID (vendor.id)
     const items = await prisma.menuItem.findMany({ 
-      where: { vendorId: req.params.vendorId as string },
+      where: { vendorId: vendor.id }, // 👈 THE CRITICAL FIX
       orderBy: { category: 'asc' }
     });
+    
     res.json({ items });
   } catch (error) {
+    console.error("🚨 FETCH MENU ERROR:", error);
     res.status(500).json({ error: 'Failed to fetch menu for editor' });
   }
 });
 
 // 1.2 Add New Item
-app.post('/api/vendors/:vendorId/menu', requireAuth, async (req, res) => {
+app.post('/api/vendors/:vendorId/menu', async (req, res) => {
   try {
-    const { name, category, price, prep, veg, available, imageUrl, description, costPrice, remark} = req.body;
+    const clerkId = req.params.vendorId;
+
+    // 1. CRITICAL STEP: Find the real Postgres UUID using the Clerk ID
+    const vendor = await prisma.vendor.findUnique({
+      where: { clerkId: clerkId }
+    });
+
+    if (!vendor) {
+      return res.status(404).json({ error: "Vendor account not found in database." });
+    }
+
+    // 2. Create the item using the REAL database ID (vendor.id)
     const newItem = await prisma.menuItem.create({
       data: {
-        vendorId: req.params.vendorId as string,
-        name, category, price: Number(price), prep: prep || '10 min', veg, available, imageUrl, description,
-        costPrice: costPrice ? parseFloat(costPrice) : null,
-        remarks: req.body.remarks
+        name: req.body.name,
+        category: req.body.category,
+        price: Number(req.body.price),
+        prep: req.body.prep,
+        veg: req.body.veg,
+        available: req.body.available,
+        imageUrl: req.body.imageUrl || null,
+        
+        // 🌟 Your new configuration fields
+        description: req.body.description || null,
+        costPrice: req.body.costPrice ? Number(req.body.costPrice) : null,
+        emoji: req.body.emoji || null,
+        remarks: req.body.remarks || null,
+        badgeLabel: req.body.badgeLabel || null,
+        
+        // THE FIX: Use the Postgres ID, not the Clerk ID
+        vendorId: vendor.id 
       }
     });
-    res.json(newItem);
+
+    // 3. Send success back to React
+    res.status(201).json(newItem);
+
   } catch (error) {
-    res.status(500).json({ error: 'Failed to add item' });
+    // 4. NEVER HIDE ERRORS AGAIN: Print them to the backend terminal
+    console.error("🚨 DATABASE CREATION FAILED:", error);
+    res.status(500).json({ error: "Failed to save to database" });
   }
 });
 
