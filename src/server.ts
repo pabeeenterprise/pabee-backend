@@ -155,7 +155,7 @@ app.get('/api/vendors/:vendorId/profile', async (req, res) => {
 // 2. Update Vendor Profile (Settings Page)
 app.patch('/api/vendors/:vendorId/profile', requireAuth, async (req, res) => {
   try {
-    const { name, businessType } = req.body;
+    const { name, businessType, useLogoAsHeader, logoUrl, dashboardLogoUrl} = req.body;
     
     const vendor = await prisma.vendor.findFirst({
       where: {
@@ -170,7 +170,7 @@ app.patch('/api/vendors/:vendorId/profile', requireAuth, async (req, res) => {
 
     const updatedVendor = await prisma.vendor.update({
       where: { id: vendor.id },
-      data: { name, businessType }
+      data: { name, businessType, useLogoAsHeader, logoUrl, dashboardLogoUrl}
     });
 
     res.json(updatedVendor);
@@ -379,7 +379,7 @@ app.delete('/api/vendors/:vendorId/menu/:itemId', requireAuth, async (req, res) 
 // --- 🎟️ OFFERS & PROMOS ROUTES ---
 
 // Helper function to safely get the true Postgres Database ID
-async function getDbVendorId(idParam) {
+async function getDbVendorId(idParam: string) {
   if (idParam.startsWith('user_')) {
     const vendor = await prisma.vendor.findUnique({ where: { clerkId: idParam } });
     return vendor ? vendor.id : null;
@@ -406,7 +406,7 @@ app.get('/api/vendors/:vendorId/promos', async (req, res) => {
 // 2. Create a new promo
 app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
   try {
-    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    const dbVendorId = await getDbVendorId(req.params.vendorId as string);
     if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
     const { code, type, value, minOrderValue, maxUses, expiresAt, isActive, applyTo } = req.body;
@@ -451,7 +451,7 @@ app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
     const { code, cartItems } = req.body; 
     
     // Calculate total cart value
-    const cartTotal = cartItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+    const cartTotal = cartItems.reduce((sum: number, item: any) => sum + (item.price * item.quantity), 0);
 
     const promo = await prisma.promo.findFirst({
       where: { vendorId: dbVendorId, code: code.toUpperCase() }
@@ -468,8 +468,8 @@ app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
     if (promo.applyTo !== "ALL") {
       // Sum up ONLY the items that match the target category (e.g., "Chaat")
       eligibleTotal = cartItems
-        .filter(item => item.category === promo.applyTo)
-        .reduce((sum, item) => sum + (item.price * item.quantity), 0);
+        .filter((item: any) => item.category === promo.applyTo)
+        .reduce((sum: number, item: any) => sum + (item.price * item.quantity), 0);
 
       if (eligibleTotal === 0) {
         return res.status(400).json({ error: `This code only applies to items in the ${promo.applyTo} category.` });
