@@ -26,6 +26,8 @@ model Vendor {
   themeMode       String     @default("dark")    // 👈 Changed from theme to match frontend
   fontFamily      String     @default("font-sans")    // 👈 ADDED NEW
   buttonRoundness String     @default("rounded-xl")   // 👈 ADDED NEW
+  storeName       String
+  useLogoAsHeader Boolean  @default(false) // Toggle: false = text, true = image
   showOfferStrip Boolean @default(false)
   offerText      String?
 
