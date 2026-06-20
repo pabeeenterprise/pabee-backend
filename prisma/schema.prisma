@@ -15,6 +15,7 @@ model Vendor {
 
   name         String?
   businessType String?    
+  address      String?  // 👈 ADD THIS EXACT LINE RIGHT HERE
 
   tier         Int        @default(1)
   defaultTable String     @default("Counter")
