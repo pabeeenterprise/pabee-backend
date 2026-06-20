@@ -17,7 +17,8 @@ app.use(cors({
     'https://project-r73rm.vercel.app' // 👈 IMPORTANT: live Vercel link here!
   ],
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'], // 👈 This is mandatory to let the Clerk token through
 }));
 
 app.post(
@@ -159,7 +160,7 @@ app.patch('/api/vendors/:vendorId/profile', requireAuth, async (req, res) => {
     
     const vendor = await prisma.vendor.findFirst({
       where: {
-        OR: [
+        OR: [ 
           { clerkId: req.params.vendorId as string },
           { id: req.params.vendorId as string }
         ]
