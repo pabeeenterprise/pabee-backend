@@ -156,7 +156,7 @@ app.get('/api/vendors/:vendorId/profile', async (req, res) => {
 // 2. Update Vendor Profile (Settings Page)
 app.patch('/api/vendors/:vendorId/profile', requireAuth, async (req, res) => {
   try {
-    const { name, businessType, useLogoAsHeader, logoUrl, dashboardLogoUrl} = req.body;
+    const { name, businessType, address, useLogoAsHeader, logoUrl, dashboardLogoUrl} = req.body;
     
     const vendor = await prisma.vendor.findFirst({
       where: {
@@ -171,7 +171,7 @@ app.patch('/api/vendors/:vendorId/profile', requireAuth, async (req, res) => {
 
     const updatedVendor = await prisma.vendor.update({
       where: { id: vendor.id },
-      data: { name, businessType, useLogoAsHeader, logoUrl, dashboardLogoUrl}
+      data: { name, businessType, address, useLogoAsHeader, logoUrl, dashboardLogoUrl}
     });
 
     res.json(updatedVendor);
