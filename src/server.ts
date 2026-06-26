@@ -5,6 +5,7 @@ import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
 import { Webhook } from 'svix';
 import { ClerkExpressRequireAuth } from '@clerk/clerk-sdk-node';
+import Razorpay from 'razorpay';
 
 const prisma = new PrismaClient();
 const app = express();
@@ -183,56 +184,104 @@ app.patch('/api/vendors/:vendorId/profile', requireAuth, async (req, res) => {
 // --- 💳 PAYMENT DATA ROUTES ---
 
 // 1. Save or Update Payment Profile
-app.post('/api/vendors/:vendorId/payment', requireAuth, async (req, res) => {
+// POST/SAVE Vendor Payment Settings
+app.post('/api/vendors/:vendorId/payment', async (req, res) => {
+  const { vendorId } = req.params;
+  const { paymentType, upiId, qrImagePath, razorpayKeyId, razorpayKeySecret, isActive } = req.body;
+
   try {
-    const { upiId, qrImagePath, isActive } = req.body;
-    if (!upiId) return res.status(400).json({ error: "upiId is required" });
-
-    const encryptedUpi = encrypt(upiId);
-
-    const paymentData = await prisma.paymentData.upsert({
-      where: { vendorId: req.params.vendorId as string },
-      update: { 
-        upiId: encryptedUpi,
-        ...(qrImagePath !== undefined && { qrImagePath }),
-        ...(isActive !== undefined && { isActive })
+    const updatedPayment = await prisma.paymentData.upsert({
+      where: { vendorId },
+      update: {
+        paymentType,
+        upiId,
+        qrImagePath,
+        razorpayKeyId,
+        // Only update the secret if the vendor typed a new one. 
+        // Otherwise, leave the existing encrypted one alone.
+        ...(razorpayKeySecret ? { razorpayKeySecret } : {}),
+        isActive
       },
       create: {
-        vendorId: req.params.vendorId as string,
-        upiId: encryptedUpi,
-        qrImagePath: qrImagePath || null,
-        isActive: isActive !== undefined ? isActive : true
+        vendorId,
+        paymentType: paymentType || 'UPI',
+        upiId: upiId || '',
+        qrImagePath: qrImagePath || '',
+        razorpayKeyId: razorpayKeyId || '',
+        razorpayKeySecret: razorpayKeySecret || '',
+        isActive: isActive ?? true
       }
     });
-
-    res.json({ success: true, message: "Payment data secured." });
+    
+    res.json({ success: true });
   } catch (error) {
-    console.error("Payment Error:", error);
-    res.status(500).json({ error: 'Failed to save payment data' });
+    console.error(error);
+    res.status(500).json({ error: "Failed to save payment data" });
   }
 });
 
 // 2. Retrieve Decrypted Payment Profile
-app.get('/api/vendors/:vendorId/payment', requireAuth, async (req, res) => {
+// 1. GET Vendor Payment Settings (For the Settings Dashboard)
+app.get('/api/vendors/:vendorId/payment', async (req, res) => {
   try {
     const paymentData = await prisma.paymentData.findUnique({
-      where: { vendorId: req.params.vendorId as string }
+      where: { vendorId: req.params.vendorId } // 👈 FIX: GET routes use params, not body
+    });
+    
+    if (!paymentData) return res.status(404).json({ error: "Payment data not found" });
+
+    // Send the data, but completely hide the Secret Key from the internet
+    res.json({
+      paymentType: paymentData.paymentType,
+      upiId: paymentData.upiId,
+      qrImagePath: paymentData.qrImagePath,
+      razorpayKeyId: paymentData.razorpayKeyId,
+      hasRazorpaySecret: !!paymentData.razorpayKeySecret,
+      isActive: paymentData.isActive
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch payment data" });
+  }
+});
+
+// 2. POST Create Razorpay Order (For the Customer Checkout Page)
+app.post('/api/checkout/razorpay', async (req, res) => {
+  try {
+    const { vendorId, amount } = req.body; // POST routes have a body!
+
+    // Fetch the vendor's private keys
+    const paymentData = await prisma.paymentData.findUnique({
+      where: { vendorId }
     });
 
     if (!paymentData) {
-      return res.status(404).json({ error: "No payment method found" });
+      return res.status(404).json({ error: "Payment data not found" });
     }
 
-    const decryptedUpi = decrypt(paymentData.upiId);
-
-    res.json({ 
-      upiId: decryptedUpi, 
-      qrImagePath: paymentData.qrImagePath,
-      isActive: paymentData.isActive,
-      paymentType: paymentData.paymentType
+    // 🛡️ The Safety Block: Prevent null crashes
+    if (!paymentData.razorpayKeyId || !paymentData.razorpayKeySecret) {
+      return res.status(400).json({ error: "This restaurant has not configured Razorpay correctly." });
+    }
+    
+    // Initialize the Razorpay engine
+    const razorpay = new Razorpay({
+      key_id: paymentData.razorpayKeyId,
+      key_secret: paymentData.razorpayKeySecret
     });
+
+    // Ask Razorpay to create a financial order
+    const options = {
+      amount: Math.round(amount * 100), // Razorpay demands paise (₹1 = 100 paise)
+      currency: "INR",
+      receipt: `receipt_${Date.now()}`
+    };
+
+    const order = await razorpay.orders.create(options);
+    res.json(order); // Send the official order ID back to the React frontend
+
   } catch (error) {
-    res.status(500).json({ error: 'Failed to retrieve payment data' });
+    console.error("Razorpay Error:", error);
+    res.status(500).json({ error: "Failed to create Razorpay order" });
   }
 });
 
@@ -260,12 +309,13 @@ app.get('/api/vendors/:vendorId/payment/public', async (req, res) => {
       return res.json({ available: false });
     }
 
-    const decryptedUpi = decrypt(activePaymentConfig.upiId);
-
+    const decryptedUpi = activePaymentConfig.upiId ? decrypt(activePaymentConfig.upiId) : '';
     res.json({ 
       available: true,
+      paymentType: activePaymentConfig.paymentType, 
       upiId: decryptedUpi, 
-      qrImagePath: activePaymentConfig.qrImagePath 
+      qrImagePath: activePaymentConfig.qrImagePath,
+      razorpayKeyId: activePaymentConfig.razorpayKeyId
     });
   } catch (error) {
     console.error("Public Payment Error:", error);
