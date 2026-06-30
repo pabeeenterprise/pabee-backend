@@ -190,25 +190,27 @@ app.post('/api/vendors/:vendorId/payment', async (req, res) => {
   const { paymentType, upiId, qrImagePath, razorpayKeyId, razorpayKeySecret, isActive } = req.body;
 
   try {
+    // 🛡️ THE FIX: Encrypt the secret if the vendor typed a new one
+    const secureSecret = razorpayKeySecret ? encrypt(razorpayKeySecret) : undefined;
+    const secureUpi = upiId ? encrypt(upiId) : '';
+
     const updatedPayment = await prisma.paymentData.upsert({
       where: { vendorId },
       update: {
         paymentType,
-        upiId,
+        upiId: secureUpi, // Encrypting this too!
         qrImagePath,
         razorpayKeyId,
-        // Only update the secret if the vendor typed a new one. 
-        // Otherwise, leave the existing encrypted one alone.
-        ...(razorpayKeySecret ? { razorpayKeySecret } : {}),
+        ...(secureSecret ? { razorpayKeySecret: secureSecret } : {}), // 👈 Save the scrambled string
         isActive
       },
       create: {
         vendorId,
         paymentType: paymentType || 'UPI',
-        upiId: upiId || '',
+        upiId: secureUpi,
         qrImagePath: qrImagePath || '',
         razorpayKeyId: razorpayKeyId || '',
-        razorpayKeySecret: razorpayKeySecret || '',
+        razorpayKeySecret: secureSecret || '',
         isActive: isActive ?? true
       }
     });
@@ -263,10 +265,11 @@ app.post('/api/checkout/razorpay', async (req, res) => {
       return res.status(400).json({ error: "This restaurant has not configured Razorpay correctly." });
     }
     
+    const unscrambledSecret = decrypt(paymentData.razorpayKeySecret);
     // Initialize the Razorpay engine
     const razorpay = new Razorpay({
       key_id: paymentData.razorpayKeyId,
-      key_secret: paymentData.razorpayKeySecret
+      key_secret: unscrambledSecret
     });
 
     // Ask Razorpay to create a financial order
