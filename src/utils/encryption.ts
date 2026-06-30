@@ -1,31 +1,40 @@
+// src/utils/encryption.ts
 import crypto from 'crypto';
 
-const algorithm = 'aes-256-cbc';
-// Ensure your .env has ENCRYPTION_KEY (must be exactly 32 characters long)
-const secretKey = crypto.createHash('sha256').update(process.env.ENCRYPTION_KEY || 'fallback_secret_must_be_changed_').digest();
+// The Master Key must live strictly in your .env file, NEVER in the code.
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; 
+const ALGORITHM = 'aes-256-cbc';
 
-export const encrypt = (text: string) => {
-  // Generate a random IV for every single encryption
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv(algorithm, secretKey, iv);
+// Brutal safety check: The server will physically refuse to boot if the key is missing or weak.
+if (!ENCRYPTION_KEY || ENCRYPTION_KEY.length !== 64) {
+  throw new Error("🔥 CRITICAL: ENCRYPTION_KEY must be exactly 64 hex characters in your .env file");
+}
 
+const key = Buffer.from(ENCRYPTION_KEY, 'hex');
+
+export function encrypt(text: string): string {
+  if (!text) return text;
+  
+  const iv = crypto.randomBytes(16); // 16 random bytes for the IV
+  const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+  
   let encrypted = cipher.update(text, 'utf8', 'hex');
   encrypted += cipher.final('hex');
-
-  // Return the IV and the encrypted text together, separated by a colon
+  
+  // Store both the random IV and the encrypted text, separated by a colon
   return `${iv.toString('hex')}:${encrypted}`;
-};
+}
 
-export const decrypt = (encryptedText: string) => {
-  // Split the stored string back into the IV and the ciphertext
-  const [ivHex, encrypted] = encryptedText.split(':');
-  if (!ivHex || !encrypted) throw new Error("Invalid encryption format");
-
-  const iv = Buffer.from(ivHex, 'hex');
-  const decipher = crypto.createDecipheriv(algorithm, secretKey, iv);
-
-  let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+export function decrypt(hash: string): string {
+  if (!hash || !hash.includes(':')) return hash; // Fallback if it's not encrypted yet
+  
+  const parts = hash.split(':');
+  const iv = Buffer.from(parts[0], 'hex');
+  const encryptedText = parts[1];
+  
+  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
+  let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
   decrypted += decipher.final('utf8');
-
+  
   return decrypted;
-};
+}
