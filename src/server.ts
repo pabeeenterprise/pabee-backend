@@ -251,9 +251,26 @@ app.post('/api/checkout/razorpay', async (req, res) => {
   try {
     const { vendorId, amount } = req.body; // POST routes have a body!
 
-    // Fetch the vendor's private keys
+    if (!vendorId || amount == null) {
+      return res.status(400).json({ error: "vendorId and amount are required" });
+    }
+
+    // Resolve Clerk ID or database UUID to the vendor record
+    const vendor = await prisma.vendor.findFirst({
+      where: {
+        OR: [
+          { clerkId: vendorId as string },
+          { id: vendorId as string }
+        ]
+      }
+    });
+
+    if (!vendor) {
+      return res.status(404).json({ error: "Vendor not found" });
+    }
+
     const paymentData = await prisma.paymentData.findUnique({
-      where: { vendorId }
+      where: { vendorId: vendor.id }
     });
 
     if (!paymentData) {
