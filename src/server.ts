@@ -710,14 +710,16 @@ app.post('/api/orders', async (req, res) => {
       return res.status(404).json({ error: "Vendor not found to attach order to." });
     }
 
+    const shortToken = Math.floor(100 + Math.random() * 900);
+
     const newOrder = await prisma.order.create({
       data: {
-        vendorId: vendor.id, // 👈 CRUCIAL: We use the translated Database ID here!
+        vendorId: vendor.id,
         tableId: tableId || 'Table-4',
         total,
         paymentMode,
         kitchenStatus: 'pending',
-        
+        token: shortToken, // 👈 USING YOUR EXISTING FIELD
         items: {
           create: items.map((cartItem: any) => ({
             name: cartItem.name,
@@ -728,8 +730,9 @@ app.post('/api/orders', async (req, res) => {
       }
     });
 
-    res.status(201).json(newOrder);
-
+    // 👈 WE RETURN IT TO THE FRONTEND HERE
+    res.status(201).json({ id: newOrder.id, tokenNumber: newOrder.token.toString() });
+    
   } catch (error) {
     console.error("🔥 CRITICAL PRISMA ERROR IN /api/orders:", error); 
     res.status(500).json({ error: "Failed to create order" });
