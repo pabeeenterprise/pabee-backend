@@ -694,7 +694,7 @@ app.get('/api/vendors/:vendorId/analytics', requireAuth, async (req, res) => {
 // 2. Create Order (Checkout)
 app.post('/api/orders', async (req, res) => {
   try {
-    const { vendorId, tableId, items, total, paymentMode, customerPhone } = req.body;
+    const { vendorId, tableId, customerName, items, total, paymentMode, customerPhone } = req.body;
 
     // 🛡️ THE FIX: Translate the incoming ID (Clerk or DB) to the pure Database ID
     const vendor = await prisma.vendor.findFirst({
@@ -715,11 +715,12 @@ app.post('/api/orders', async (req, res) => {
     const newOrder = await prisma.order.create({
       data: {
         vendorId: vendor.id,
-        tableId: tableId || 'Table-4',
+        tableId: tableId || null,
+        customerName: customerName,
         total,
         paymentMode,
         kitchenStatus: 'pending',
-        token: shortToken, // 👈 USING YOUR EXISTING FIELD
+        token: shortToken, 
         items: {
           create: items.map((cartItem: any) => ({
             name: cartItem.name,
