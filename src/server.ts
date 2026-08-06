@@ -474,58 +474,46 @@ app.get('/api/vendors/:vendorId/promos', async (req, res) => {
   }
 });
 
-// 2. Create a new promo (WITH GHOST ROW UPSERT)
+// 2. Create a new promo (NATIVE UPSERT)
 app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
   try {
     const dbVendorId = await getDbVendorId(req.params.vendorId as string);
     if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
     const { code, type, value, minOrderValue, maxUses, expiresAt, isActive, applyTo } = req.body;
-
-    // Clean the code to remove invisible spaces before searching
     const cleanCode = code.trim().toUpperCase();
 
-    // 1. Check if the code already exists
-    const existingPromo = await prisma.promo.findFirst({
-      where: { 
-        vendorId: dbVendorId, 
-        code: cleanCode 
-      }
-    });
-
-    // 2. If it exists, OVERWRITE IT instead of crashing
-    if (existingPromo) {
-      const revivedPromo = await prisma.promo.update({
-        where: { id: existingPromo.id },
-        data: {
-          type,
-          value: Number(value),
-          minOrderValue: Number(minOrderValue || 0),
-          maxUses: maxUses ? Number(maxUses) : null,
-          expiresAt: expiresAt ? new Date(expiresAt) : null,
-          isActive,
-          applyTo: applyTo || "ALL"
+    // 🌟 NATIVE PRISMA UPSERT: Atomically updates if exists, creates if it doesn't.
+    const savedPromo = await prisma.promo.upsert({
+      where: {
+        vendorId_code: { // 👈 This targets your @@unique constraint directly
+          vendorId: dbVendorId,
+          code: cleanCode
         }
-      });
-      return res.json(revivedPromo);
-    }
-
-    // 3. If it does not exist, CREATE it normally
-    const newPromo = await prisma.promo.create({
-      data: {
-        vendorId: dbVendorId,
-        code: code.toUpperCase(),
+      },
+      update: {
         type,
         value: Number(value),
         minOrderValue: Number(minOrderValue || 0),
         maxUses: maxUses ? Number(maxUses) : null,
         expiresAt: expiresAt ? new Date(expiresAt) : null,
-        isActive,
+        isActive: true, // Always revive it
+        applyTo: applyTo || "ALL"
+      },
+      create: {
+        vendorId: dbVendorId,
+        code: cleanCode,
+        type,
+        value: Number(value),
+        minOrderValue: Number(minOrderValue || 0),
+        maxUses: maxUses ? Number(maxUses) : null,
+        expiresAt: expiresAt ? new Date(expiresAt) : null,
+        isActive: true,
         applyTo: applyTo || "ALL"
       }
     });
     
-    res.json(newPromo);
+    res.json(savedPromo);
 
   } catch (error) {
     console.error("Promo error:", error);
