@@ -515,9 +515,9 @@ app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
     
     res.json(savedPromo);
 
-  } catch (error) {
+  } catch (error: any) {
     console.error("Promo error:", error);
-    res.status(500).json({ error: 'Failed to create promo. Code might already exist.' });
+    res.status(500).json({ error: `DEBUG INFO: ${error.message || String(error)}` });
   }
 });
 
