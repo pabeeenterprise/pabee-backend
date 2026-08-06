@@ -481,12 +481,15 @@ app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
     if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
     const { code, type, value, minOrderValue, maxUses, expiresAt, isActive, applyTo } = req.body;
-    
-    // 1. Check if the code already exists in the database (active or inactive)
+
+    // Clean the code to remove invisible spaces before searching
+    const cleanCode = code.trim().toUpperCase();
+
+    // 1. Check if the code already exists
     const existingPromo = await prisma.promo.findFirst({
       where: { 
         vendorId: dbVendorId, 
-        code: code.toUpperCase() 
+        code: cleanCode 
       }
     });
 
