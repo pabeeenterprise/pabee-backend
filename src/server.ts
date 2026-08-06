@@ -474,7 +474,7 @@ app.get('/api/vendors/:vendorId/promos', async (req, res) => {
   }
 });
 
-// 2. Create a new promo
+// 2. Create a new promo (WITH GHOST ROW UPSERT)
 app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
   try {
     const dbVendorId = await getDbVendorId(req.params.vendorId as string);
@@ -482,6 +482,32 @@ app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
 
     const { code, type, value, minOrderValue, maxUses, expiresAt, isActive, applyTo } = req.body;
     
+    // 1. Check if the code already exists in the database (active or inactive)
+    const existingPromo = await prisma.promo.findFirst({
+      where: { 
+        vendorId: dbVendorId, 
+        code: code.toUpperCase() 
+      }
+    });
+
+    // 2. If it exists, OVERWRITE IT instead of crashing
+    if (existingPromo) {
+      const revivedPromo = await prisma.promo.update({
+        where: { id: existingPromo.id },
+        data: {
+          type,
+          value: Number(value),
+          minOrderValue: Number(minOrderValue || 0),
+          maxUses: maxUses ? Number(maxUses) : null,
+          expiresAt: expiresAt ? new Date(expiresAt) : null,
+          isActive,
+          applyTo: applyTo || "ALL"
+        }
+      });
+      return res.json(revivedPromo);
+    }
+
+    // 3. If it does not exist, CREATE it normally
     const newPromo = await prisma.promo.create({
       data: {
         vendorId: dbVendorId,
@@ -492,12 +518,14 @@ app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
         maxUses: maxUses ? Number(maxUses) : null,
         expiresAt: expiresAt ? new Date(expiresAt) : null,
         isActive,
-        applyTo: applyTo || "ALL" // 👈 SAVES THE CATEGORY TARGET
+        applyTo: applyTo || "ALL"
       }
     });
+    
     res.json(newPromo);
+
   } catch (error) {
-    console.error(error);
+    console.error("Promo error:", error);
     res.status(500).json({ error: 'Failed to create promo. Code might already exist.' });
   }
 });
