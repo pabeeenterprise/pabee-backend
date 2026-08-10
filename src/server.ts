@@ -541,8 +541,8 @@ app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
     const { code, cartItems } = req.body; 
     
     // Calculate total cart value
-    const cartTotal = cartItems.reduce((sum: number, item: any) => sum + (item.price * item.quantity), 0);
-
+    const cartTotal = cartItems.reduce((sum: number, item: any) => sum + (item.price * item.qty), 0);
+    
     const promo = await prisma.promo.findFirst({
       where: { vendorId: dbVendorId, code: code.toUpperCase() }
     });
@@ -559,7 +559,7 @@ app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
       // Sum up ONLY the items that match the target category (e.g., "Chaat")
       eligibleTotal = cartItems
         .filter((item: any) => item.category === promo.applyTo)
-        .reduce((sum: number, item: any) => sum + (item.price * item.quantity), 0);
+        .reduce((sum: number, item: any) => sum + (item.price * item.qty), 0);
 
       if (eligibleTotal === 0) {
         return res.status(400).json({ error: `This code only applies to items in the ${promo.applyTo} category.` });
