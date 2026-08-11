@@ -558,11 +558,11 @@ app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
     if (promo.applyTo !== "ALL") {
       // Sum up ONLY the items that match the target category (e.g., "Chaat")
       eligibleTotal = cartItems
-        .filter((item: any) => item.category === promo.applyTo)
+        .filter((item: any) => item.category === promo.applyTo || item.name === promo.applyTo)
         .reduce((sum: number, item: any) => sum + (item.price * item.qty), 0);
 
       if (eligibleTotal === 0) {
-        return res.status(400).json({ error: `This code only applies to items in the ${promo.applyTo} category.` });
+        return res.status(400).json({ error: `This code only applies to ${promo.applyTo}.` });
       }
     }
 
