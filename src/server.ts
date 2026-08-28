@@ -715,7 +715,7 @@ app.post('/api/orders', async (req, res) => {
   try {
     const { vendorId, tableId, customerName, items, total, paymentMode, customerPhone } = req.body;
 
-    // 🛡️ THE FIX: Translate the incoming ID (Clerk or DB) to the pure Database ID
+    // 🛡️ STEP 1: Translate the incoming ID (Clerk or DB) to the pure Database ID
     const vendor = await prisma.vendor.findFirst({
       where: {
         OR: [
@@ -729,25 +729,45 @@ app.post('/api/orders', async (req, res) => {
       return res.status(404).json({ error: "Vendor not found to attach order to." });
     }
 
-    const shortToken = Math.floor(100 + Math.random() * 900);
+    // 1. Establish the midnight reset boundary
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
 
-    const newOrder = await prisma.order.create({
-      data: {
-        vendorId: vendor.id,
-        tableId: tableId || null,
-        customerName: customerName,
-        total,
-        paymentMode,
-        kitchenStatus: 'pending',
-        token: shortToken, 
-        items: {
-          create: items.map((cartItem: any) => ({
-            name: cartItem.name,
-            qty: cartItem.qty,
-            price: cartItem.price 
-          }))
+    // 🚨 2. THE ATOMIC LOCK: Execute read and write together safely
+    const newOrder = await prisma.$transaction(async (tx) => {
+      
+      // Step A: Find the highest token for this vendor TODAY
+      const lastOrder = await tx.order.findFirst({
+        where: {
+          vendorId: vendor.id,
+          createdAt: { gte: startOfToday },
+        },
+        orderBy: { token: 'desc' },
+      });
+
+      // Step B: Calculate the next logical number
+      const nextToken = lastOrder?.token ? lastOrder.token + 1 : 1;
+
+      // Step C: Save the order
+      return await tx.order.create({
+        data: {
+          vendorId: vendor.id,
+          token: nextToken, // Mathematically safe sequential number
+          customerName: customerName || "Counter Order",
+          customerPhone: customerPhone || "0000000000",
+          paymentMode: paymentMode,
+          tableId: tableId || "Counter",
+          total: total,
+          kitchenStatus: 'pending',
+          items: {
+            create: items.map((cartItem: any) => ({
+              name: cartItem.name,
+              qty: cartItem.qty,
+              price: cartItem.price 
+            }))
+          }
         }
-      }
+      });
     });
 
     // 👈 WE RETURN IT TO THE FRONTEND HERE
