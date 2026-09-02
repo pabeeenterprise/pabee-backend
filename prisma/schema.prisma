@@ -15,6 +15,7 @@ model Vendor {
 
   name         String?
   masterPin        String?
+  expenses         DailyExpense[]
   businessType String?    
   address      String?  // 👈 ADD THIS EXACT LINE RIGHT HERE
 
@@ -136,4 +137,15 @@ model Promo {
   vendor        Vendor    @relation(fields: [vendorId], references: [id])
 
   @@unique([vendorId, code]) // A vendor can't have two identical codes active
+}
+
+model DailyExpense {
+  id          String   @id @default(uuid())
+  vendorId    String
+  amount      Float
+  category    String   // e.g., "Raw Materials", "Fuel", "Packaging"
+  description String?  // e.g., "5kg onions, 2kg chicken"
+  date        DateTime @default(now())
+  
+  vendor      Vendor   @relation(fields: [vendorId], references: [id])
 }
