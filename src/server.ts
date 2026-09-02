@@ -181,7 +181,73 @@ app.patch('/api/vendors/:vendorId/profile', requireAuth, async (req, res) => {
   }
 });
 
+// 3. SET OR UPDATE MASTER PIN
+app.post('/api/vendors/:vendorId/pin', requireAuth, async (req, res) => {
+  try {
+    const { pin } = req.body;
+    
+    // Basic validation: Must be exactly 4 digits
+    if (!pin || !/^\d{4}$/.test(pin)) {
+      return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+    }
 
+    // ✅ THIS FIXES THE STRICT TYPING
+const vendor = await prisma.vendor.findFirst({
+  where: {
+    OR: [ 
+      { clerkId: req.params.vendorId as string }, 
+      { id: req.params.vendorId as string } 
+    ]
+  }
+});
+
+    if (!vendor) return res.status(404).json({ error: 'Vendor not found' });
+
+    // Save the PIN to the database
+    await prisma.vendor.update({
+      where: { id: vendor.id },
+      data: { masterPin: pin }
+    });
+
+    res.json({ success: true, message: 'Master PIN securely updated' });
+  } catch (error) {
+    console.error("PIN Update Error:", error);
+    res.status(500).json({ error: 'Failed to update PIN' });
+  }
+});
+
+// 4. VERIFY MASTER PIN (The Lock Screen Check)
+app.post('/api/vendors/:vendorId/pin/verify', async (req, res) => {
+  try {
+    const { pin } = req.body;
+
+    // ✅ THIS FIXES THE STRICT TYPING
+const vendor = await prisma.vendor.findFirst({
+  where: {
+    OR: [ 
+      { clerkId: req.params.vendorId as string }, 
+      { id: req.params.vendorId as string } 
+    ]
+  }
+});
+
+    if (!vendor) return res.status(404).json({ error: 'Vendor not found' });
+
+    // If the owner hasn't set a PIN yet, default to allowing access or prompt them to set one.
+    if (!vendor.masterPin) {
+      return res.json({ success: true, isSetupRequired: true }); 
+    }
+
+    if (vendor.masterPin === pin) {
+      return res.json({ success: true });
+    } else {
+      return res.status(401).json({ success: false, error: 'Incorrect PIN' });
+    }
+  } catch (error) {
+    console.error("PIN Verification Error:", error);
+    res.status(500).json({ error: 'Failed to verify PIN' });
+  }
+});
 
 // --- 💳 PAYMENT DATA ROUTES ---
 
