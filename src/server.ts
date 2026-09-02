@@ -249,6 +249,79 @@ const vendor = await prisma.vendor.findFirst({
   }
 });
 
+// --- 💰 INVENTORY & DAILY EXPENSES ---
+
+// 1. Log a new morning purchase (Money Out)
+app.post('/api/vendors/:vendorId/expenses', async (req, res) => {
+  try {
+    const { amount, category, description } = req.body;
+    
+    // We already know it's a UUID from your frontend logic, but we ensure it matches
+    const vendorId = req.params.vendorId; 
+
+    const newExpense = await prisma.dailyExpense.create({
+      data: {
+        vendorId: vendorId,
+        amount: Number(amount),
+        category: category || 'Raw Materials',
+        description: description || ''
+      }
+    });
+
+    res.status(201).json(newExpense);
+  } catch (error) {
+    console.error("Expense Log Error:", error);
+    res.status(500).json({ error: 'Failed to log inventory expense' });
+  }
+});
+
+// 2. Get Today's Profit & Loss (Revenue vs Expenses)
+app.get('/api/vendors/:vendorId/profit/today', async (req, res) => {
+  try {
+    const vendorId = req.params.vendorId;
+
+    // Set boundary for exactly midnight today (IST)
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    // Get Money IN (Completed Orders)
+    const todaysOrders = await prisma.order.aggregate({
+      where: { 
+        vendorId: vendorId, 
+        createdAt: { gte: startOfToday }, 
+        kitchenStatus: 'completed' 
+      },
+      _sum: { total: true }
+    });
+
+    // Get Money OUT (Inventory & Expenses)
+    const todaysExpenses = await prisma.dailyExpense.findMany({
+      where: { 
+        vendorId: vendorId, 
+        date: { gte: startOfToday } 
+      },
+      orderBy: { date: 'desc' }
+    });
+
+    // Calculate Totals
+    const grossRevenue = todaysOrders._sum.total || 0;
+    const totalCost = todaysExpenses.reduce((sum: number, exp: any) => sum + exp.amount, 0);
+    const netProfit = grossRevenue - totalCost;
+
+    res.json({
+      success: true,
+      grossRevenue,
+      totalCost,
+      netProfit,
+      expensesList: todaysExpenses // Send the list back to show on the UI
+    });
+
+  } catch (error) {
+    console.error("Profit Math Error:", error);
+    res.status(500).json({ error: 'Failed to calculate daily profit' });
+  }
+});
+
 // --- 💳 PAYMENT DATA ROUTES ---
 
 // 1. Save or Update Payment Profile
