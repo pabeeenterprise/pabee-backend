@@ -181,6 +181,8 @@ app.patch('/api/vendors/:vendorId/profile', requireAuth, async (req, res) => {
   }
 });
 
+
+
 // --- 💳 PAYMENT DATA ROUTES ---
 
 // 1. Save or Update Payment Profile

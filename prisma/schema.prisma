@@ -14,6 +14,7 @@ model Vendor {
   email        String   @unique  // Stores their Google/Sign-up email
 
   name         String?
+  masterPin        String?
   businessType String?    
   address      String?  // 👈 ADD THIS EXACT LINE RIGHT HERE
 
