@@ -322,6 +322,88 @@ app.get('/api/vendors/:vendorId/profit/today', async (req, res) => {
   }
 });
 
+// --- 📦 INVENTORY & RECIPES MANAGEMENT ---
+
+// 1. Get raw inventory items
+app.get('/api/vendors/:vendorId/inventory', async (req, res) => {
+  try {
+    const items = await prisma.inventoryItem.findMany({
+      where: { vendorId: req.params.vendorId as string },
+      orderBy: { name: 'asc' }
+    });
+    res.json({ items });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch inventory' });
+  }
+});
+
+// 2. Create a new raw inventory item (g, ml, pcs)
+app.post('/api/vendors/:vendorId/inventory', async (req, res) => {
+  try {
+    const { name, unit, currentStock, minAlert, costPerUnit } = req.body;
+    
+    if (!['g', 'ml', 'pcs'].includes(unit)) {
+      return res.status(400).json({ error: 'Unit must be g, ml, or pcs' });
+    }
+
+    const newItem = await prisma.inventoryItem.create({
+      data: {
+        vendorId: req.params.vendorId as string,
+        name: name.trim(),
+        unit,
+        currentStock: Number(currentStock) || 0,
+        minAlert: Number(minAlert) || 0,
+        costPerUnit: Number(costPerUnit) || 0
+      }
+    });
+
+    res.status(201).json(newItem);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create inventory item' });
+  }
+});
+
+// 3. Link ingredients to a dish (Save Recipe)
+app.post('/api/vendors/:vendorId/menu/:itemId/recipe', requireAuth, async (req, res) => {
+  try {
+    const { ingredients } = req.body; // Array of { inventoryItemId: string, quantityUsed: number }
+
+    // Clear old recipe associations
+    await prisma.recipeItem.deleteMany({
+      where: { menuItemId: req.params.itemId as string }
+    });
+
+    // Bulk attach new recipe ingredients
+    if (Array.isArray(ingredients) && ingredients.length > 0) {
+      await prisma.recipeItem.createMany({
+        data: ingredients.map((ing: any) => ({
+          menuItemId: req.params.itemId as string,
+          inventoryItemId: ing.inventoryItemId,
+          quantityUsed: Number(ing.quantityUsed)
+        }))
+      });
+    }
+
+    res.json({ success: true, message: 'Recipe configuration saved' });
+  } catch (error) {
+    console.error("Recipe Link Error:", error);
+    res.status(500).json({ error: 'Failed to link recipe ingredients' });
+  }
+});
+
+// 4. Fetch linked recipe for a menu item
+app.get('/api/vendors/:vendorId/menu/:itemId/recipe', async (req, res) => {
+  try {
+    const recipe = await prisma.recipeItem.findMany({
+      where: { menuItemId: req.params.itemId as string },
+      include: { inventoryItem: true }
+    });
+    res.json({ recipe });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch dish recipe' });
+  }
+});
+
 // --- 💳 PAYMENT DATA ROUTES ---
 
 // 1. Save or Update Payment Profile
@@ -890,10 +972,10 @@ app.post('/api/orders', async (req, res) => {
       const nextToken = lastOrder?.token ? lastOrder.token + 1 : 1;
 
       // Step C: Save the order
-      return await tx.order.create({
+      const createdOrder = await tx.order.create({
         data: {
           vendorId: vendor.id,
-          token: nextToken, // Mathematically safe sequential number
+          token: nextToken,
           customerName: customerName || "Counter Order",
           customerPhone: customerPhone || "0000000000",
           paymentMode: paymentMode,
@@ -909,6 +991,28 @@ app.post('/api/orders', async (req, res) => {
           }
         }
       });
+
+      // Step D: Decrement inventory using strict recipe deductions
+      for (const cartItem of items) {
+        const menuItemWithRecipe = await tx.menuItem.findFirst({
+          where: { vendorId: vendor.id, name: cartItem.name },
+          include: { recipes: true }
+        });
+
+        if (menuItemWithRecipe && menuItemWithRecipe.recipes.length > 0) {
+          for (const recipe of menuItemWithRecipe.recipes) {
+            const totalDeduction = recipe.quantityUsed * cartItem.qty;
+            await tx.inventoryItem.update({
+              where: { id: recipe.inventoryItemId },
+              data: {
+                currentStock: { decrement: totalDeduction }
+              }
+            });
+          }
+        }
+      }
+
+      return createdOrder;
     });
 
     // 👈 WE RETURN IT TO THE FRONTEND HERE
