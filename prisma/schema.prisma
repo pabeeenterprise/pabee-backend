@@ -16,6 +16,7 @@ model Vendor {
   name         String?
   masterPin        String?
   expenses         DailyExpense[]
+  inventoryItems   InventoryItem[]
   businessType String?    
   address      String?  // 👈 ADD THIS EXACT LINE RIGHT HERE
 
@@ -80,6 +81,7 @@ model MenuItem {
   veg         Boolean  @default(true)
   available   Boolean  @default(true)
   imageUrl  String?
+  recipes     RecipeItem[]
 
   // 🌟 ADD THESE CONFIGURATION FIELDS TO MATCH YOUR FRONTEND
   description  String?
@@ -148,4 +150,31 @@ model DailyExpense {
   date        DateTime @default(now())
   
   vendor      Vendor   @relation(fields: [vendorId], references: [id])
+}
+
+model InventoryItem {
+  id           String       @id @default(uuid())
+  vendorId     String
+  name         String       // e.g., "Dairy Milk", "Sandwich Bread", "Amul Butter"
+  unit         String       // Strictly "g", "ml", or "pcs"
+  currentStock Float        @default(0)
+  minAlert     Float        @default(100) // Minimum threshold before low-stock warning
+  costPerUnit  Float        @default(0)   // Cost per g, ml, or pc
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  vendor       Vendor       @relation(fields: [vendorId], references: [id])
+  recipeItems  RecipeItem[]
+}
+
+model RecipeItem {
+  id              String        @id @default(uuid())
+  menuItemId      String
+  inventoryItemId String
+  quantityUsed    Float         // e.g., 150 (ml), 2 (pcs), 15 (g)
+
+  menuItem        MenuItem      @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
+
+  @@unique([menuItemId, inventoryItemId])
 }
