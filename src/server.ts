@@ -391,6 +391,56 @@ app.post('/api/vendors/:vendorId/menu/:itemId/recipe', requireAuth, async (req, 
   }
 });
 
+// POST /api/vendors/:vendorId/inventory/:itemId/restock
+app.post('/api/vendors/:vendorId/inventory/:itemId/restock', requireAuth, async (req, res) => {
+  try {
+    const { quantityToAdd, totalPurchaseCost } = req.body;
+    const vendorId = req.params.vendorId as string;
+    const itemId = req.params.itemId as string;
+
+    const qty = Number(quantityToAdd);
+    const cost = Number(totalPurchaseCost);
+
+    if (qty <= 0) return res.status(400).json({ error: "Invalid quantity" });
+
+    const updatedItem = await prisma.$transaction(async (tx) => {
+      // 1. Fetch existing item
+      const item = await tx.inventoryItem.findUnique({ where: { id: itemId } });
+      if (!item) throw new Error("Ingredient not found");
+
+      // 2. Calculate new weighted cost per unit
+      const newCostPerUnit = cost > 0 ? cost / qty : item.costPerUnit;
+
+      // 3. Increment stock & update cost
+      const updated = await tx.inventoryItem.update({
+        where: { id: itemId },
+        data: {
+          currentStock: { increment: qty },
+          costPerUnit: newCostPerUnit
+        }
+      });
+
+      // 4. Automatically log this refill to DailyExpense (P&L Ledger)
+      if (cost > 0) {
+        await tx.dailyExpense.create({
+          data: {
+            vendorId: vendorId as string,
+            amount: cost,
+            category: 'Raw Materials',
+            description: `Refilled ${qty} ${item.unit} of ${item.name}`
+          }
+        });
+      }
+
+      return updated;
+    });
+
+    res.json(updatedItem);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || "Failed to refill stock" });
+  }
+});
+
 // 4. Fetch linked recipe for a menu item
 app.get('/api/vendors/:vendorId/menu/:itemId/recipe', async (req, res) => {
   try {

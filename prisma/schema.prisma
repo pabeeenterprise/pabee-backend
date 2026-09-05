@@ -165,6 +165,7 @@ model InventoryItem {
 
   vendor       Vendor       @relation(fields: [vendorId], references: [id])
   recipeItems  RecipeItem[]
+  @@unique([vendorId, name])
 }
 
 model RecipeItem {
