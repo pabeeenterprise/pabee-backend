@@ -396,7 +396,7 @@ app.post('/api/vendors/:vendorId/inventory/:itemId/restock', requireAuth, async 
   try {
     const { quantityToAdd, totalPurchaseCost } = req.body;
     const vendorId = req.params.vendorId as string;
-    const itemId = req.params.itemId as string;
+    const itemId = req.params.itemId as string; 
 
     const qty = Number(quantityToAdd);
     const cost = Number(totalPurchaseCost);
