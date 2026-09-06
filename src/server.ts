@@ -398,7 +398,7 @@ app.post('/api/vendors/:vendorId/inventory/:itemId/restock', requireAuth, async 
     const vendorId = req.params.vendorId as string;
     const itemId = req.params.itemId as string; 
 
-    const qty = Number(quantityToAdd);
+    const qty = Number(quantityToAdd); 
     const cost = Number(totalPurchaseCost);
 
     if (qty <= 0) return res.status(400).json({ error: "Invalid quantity" });
