@@ -736,9 +736,16 @@ app.get('/api/vendors/:vendorId/promos', async (req, res) => {
   try {
     const dbVendorId = await getDbVendorId(req.params.vendorId);
     if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
+    const now = new Date();
     const promos = await prisma.promo.findMany({
-      where: { vendorId: dbVendorId },
+      where: { 
+        vendorId: dbVendorId,
+        isActive: true,
+        OR: [
+          { expiresAt: null },       // Never expires
+          { expiresAt: { gt: now } } // Expiration date is in the future
+        ]
+      },
       orderBy: { createdAt: 'desc' }
     });
     res.json({ promos });
