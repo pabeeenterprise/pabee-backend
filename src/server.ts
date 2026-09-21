@@ -363,10 +363,10 @@ app.post('/api/vendors/:vendorId/inventory', async (req, res) => {
         await tx.dailyExpense.create({
           data: {
             vendorId: dbVendorId,
-            title: `Initial Stock: ${name.trim()} (${currentStock} ${unit})`,
+            description: `Initial Stock: ${name.trim()} (${currentStock} ${unit})`,
             amount: Number(totalPurchaseCost),
             category: 'INVENTORY_PURCHASE',
-            createdAt: new Date()
+            date: new Date()
           }
         });
       }
