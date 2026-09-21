@@ -340,26 +340,44 @@ app.get('/api/vendors/:vendorId/inventory', async (req, res) => {
 // 2. Create a new raw inventory item (g, ml, pcs)
 app.post('/api/vendors/:vendorId/inventory', async (req, res) => {
   try {
-    const { name, unit, currentStock, minAlert, costPerUnit } = req.body;
-    
-    if (!['g', 'ml', 'pcs'].includes(unit)) {
-      return res.status(400).json({ error: 'Unit must be g, ml, or pcs' });
-    }
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
-    const newItem = await prisma.inventoryItem.create({
-      data: {
-        vendorId: req.params.vendorId as string,
-        name: name.trim(),
-        unit,
-        currentStock: Number(currentStock) || 0,
-        minAlert: Number(minAlert) || 0,
-        costPerUnit: Number(costPerUnit) || 0
+    const { name, unit, currentStock, minAlert, costPerUnit, totalPurchaseCost } = req.body;
+
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Create the inventory item
+      const item = await tx.inventoryItem.create({
+        data: {
+          vendorId: dbVendorId,
+          name: name.trim(),
+          unit,
+          currentStock: Number(currentStock) || 0,
+          minAlert: Number(minAlert) || 0,
+          costPerUnit: Number(costPerUnit) || 0
+        }
+      });
+
+      // 2. If a purchase cost was entered, record it in the Daily P&L Ledger
+      if (Number(totalPurchaseCost) > 0) {
+        await tx.dailyExpense.create({
+          data: {
+            vendorId: dbVendorId,
+            title: `Initial Stock: ${name.trim()} (${currentStock} ${unit})`,
+            amount: Number(totalPurchaseCost),
+            category: 'INVENTORY_PURCHASE',
+            createdAt: new Date()
+          }
+        });
       }
+
+      return item;
     });
 
-    res.status(201).json(newItem);
+    res.json({ success: true, item: result });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to create inventory item' });
+    console.error("Failed to register inventory item:", error);
+    res.status(500).json({ error: 'Failed to register inventory item' });
   }
 });
 
