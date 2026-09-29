@@ -1013,7 +1013,6 @@ app.post('/api/orders', async (req, res) => {
   try {
     const { vendorId, tableId, customerName, items, total, paymentMode, customerPhone } = req.body;
 
-    // 🛡️ STEP 1: Translate the incoming ID (Clerk or DB) to the pure Database ID
     const vendor = await prisma.vendor.findFirst({
       where: {
         OR: [
@@ -1027,14 +1026,12 @@ app.post('/api/orders', async (req, res) => {
       return res.status(404).json({ error: "Vendor not found to attach order to." });
     }
 
-    // 1. Establish the midnight reset boundary
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
 
-    // 🚨 2. THE ATOMIC LOCK: Execute read and write together safely
+    // 🚨 ATOMIC TRANSACTION
     const newOrder = await prisma.$transaction(async (tx) => {
-      
-      // Step A: Find the highest token for this vendor TODAY
+      // Step A: Token generation
       const lastOrder = await tx.order.findFirst({
         where: {
           vendorId: vendor.id,
@@ -1042,11 +1039,62 @@ app.post('/api/orders', async (req, res) => {
         },
         orderBy: { token: 'desc' },
       });
-
-      // Step B: Calculate the next logical number
       const nextToken = lastOrder?.token ? lastOrder.token + 1 : 1;
 
-      // Step C: Save the order
+      // Step B: Fetch all ordered menu items with their recipes in ONE query
+      const cartItemNames = items.map((i: any) => i.name.trim());
+      const menuItems = await tx.menuItem.findMany({
+        where: {
+          vendorId: vendor.id,
+          name: { in: cartItemNames, mode: 'insensitive' }
+        },
+        include: {
+          recipes: {
+            include: { inventoryItem: true }
+          }
+        }
+      });
+
+      // Step C: Aggregate total demand per raw ingredient across the entire cart
+      // Map: inventoryItemId -> { item, totalNeeded, dishNames }
+      const ingredientDemand = new Map<string, { item: any; totalNeeded: number; dishNames: string[] }>();
+
+      for (const cartItem of items) {
+        const matchedDish = menuItems.find(
+          (m: any) => m.name.toLowerCase() === cartItem.name.trim().toLowerCase()
+        );
+
+        if (matchedDish && matchedDish.recipes?.length > 0) {
+          for (const recipe of matchedDish.recipes) {
+            const qtyUsed = Number(recipe.quantityUsed) * Number(cartItem.qty);
+            const existing = ingredientDemand.get(recipe.inventoryItemId);
+
+            if (existing) {
+              existing.totalNeeded += qtyUsed;
+              existing.dishNames.push(cartItem.name);
+            } else {
+              ingredientDemand.set(recipe.inventoryItemId, {
+                item: recipe.inventoryItem,
+                totalNeeded: qtyUsed,
+                dishNames: [cartItem.name]
+              });
+            }
+          }
+        }
+      }
+
+      // Step D: Pre-Validate Aggregated Stock (Prevents Negative Stock)
+      for (const [inventoryId, demand] of ingredientDemand.entries()) {
+        if (demand.item.currentStock < demand.totalNeeded) {
+          const shortageError: any = new Error(
+            `Insufficient stock for "${demand.item.name}". Required: ${demand.totalNeeded} ${demand.item.unit}, Available: ${demand.item.currentStock} ${demand.item.unit}. Affects: ${demand.dishNames.join(', ')}.`
+          );
+          shortageError.statusCode = 400;
+          throw shortageError;
+        }
+      }
+
+      // Step E: Create Order
       const createdOrder = await tx.order.create({
         data: {
           vendorId: vendor.id,
@@ -1067,22 +1115,33 @@ app.post('/api/orders', async (req, res) => {
         }
       });
 
-      // Step D: Decrement inventory using strict recipe deductions
-      for (const cartItem of items) {
-        const menuItemWithRecipe = await tx.menuItem.findFirst({
-          where: { vendorId: vendor.id, name: cartItem.name },
-          include: { recipes: true }
+      // Step F: Decrement Inventory & Trigger Auto-86
+      for (const [inventoryId, demand] of ingredientDemand.entries()) {
+        const updatedStock = await tx.inventoryItem.update({
+          where: { id: inventoryId },
+          data: {
+            currentStock: { decrement: demand.totalNeeded }
+          }
         });
 
-        if (menuItemWithRecipe && menuItemWithRecipe.recipes.length > 0) {
-          for (const recipe of menuItemWithRecipe.recipes) {
-            const totalDeduction = recipe.quantityUsed * cartItem.qty;
-            await tx.inventoryItem.update({
-              where: { id: recipe.inventoryItemId },
-              data: {
-                currentStock: { decrement: totalDeduction }
-              }
+        console.log(`📉 Stock Decremented: ${updatedStock.name} by ${demand.totalNeeded} ${updatedStock.unit}. Remaining: ${updatedStock.currentStock}`);
+
+        // 🚨 AUTO-86 ENGINE: If stock drops to 0 or below, shut down dependent dishes
+        if (updatedStock.currentStock <= 0) {
+          // Query tx.recipeItem (matches your model RecipeItem exactly)
+          const depletedLinks = await tx.recipeItem.findMany({
+            where: { inventoryItemId: updatedStock.id },
+            select: { menuItemId: true }
+          });
+
+          const dishIdsToDisable = depletedLinks.map((r) => r.menuItemId);
+
+          if (dishIdsToDisable.length > 0) {
+            await tx.menuItem.updateMany({
+              where: { id: { in: dishIdsToDisable } },
+              data: { available: false }
             });
+            console.warn(`🛑 AUTO-86 ACTIVATED: Marked ${dishIdsToDisable.length} dishes unavailable due to depleted ${updatedStock.name}`);
           }
         }
       }
@@ -1090,11 +1149,16 @@ app.post('/api/orders', async (req, res) => {
       return createdOrder;
     });
 
-    // 👈 WE RETURN IT TO THE FRONTEND HERE
     res.status(201).json({ id: newOrder.id, tokenNumber: newOrder.token.toString() });
+
+  } catch (error: any) {
+    console.error("🔥 ORDER CHECKOUT ERROR:", error.message || error);
     
-  } catch (error) {
-    console.error("🔥 CRITICAL PRISMA ERROR IN /api/orders:", error); 
+    // Return clean 400 for stock shortages instead of crashing with 500
+    if (error.statusCode === 400) {
+      return res.status(400).json({ error: error.message });
+    }
+
     res.status(500).json({ error: "Failed to create order" });
   }
 });
