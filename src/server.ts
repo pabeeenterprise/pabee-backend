@@ -413,10 +413,11 @@ app.post('/api/vendors/:vendorId/menu/:itemId/recipe', requireAuth, async (req, 
 app.post('/api/vendors/:vendorId/inventory/:itemId/restock', requireAuth, async (req, res) => {
   try {
     const { quantityToAdd, totalPurchaseCost } = req.body;
-    const vendorId = req.params.vendorId as string;
-    const itemId = req.params.itemId as string; 
+    const dbVendorId = await getDbVendorId(req.params.vendorId as string);
+    if (!dbVendorId) return res.status(404).json({ error: "Vendor not found" });
 
-    const qty = Number(quantityToAdd); 
+    const itemId = req.params.itemId as string;
+    const qty = Number(quantityToAdd);
     const cost = Number(totalPurchaseCost);
 
     if (qty <= 0) return res.status(400).json({ error: "Invalid quantity" });
@@ -426,7 +427,7 @@ app.post('/api/vendors/:vendorId/inventory/:itemId/restock', requireAuth, async 
       const item = await tx.inventoryItem.findUnique({ where: { id: itemId } });
       if (!item) throw new Error("Ingredient not found");
 
-      // 2. Calculate new weighted cost per unit
+      // 2. Calculate new cost per unit
       const newCostPerUnit = cost > 0 ? cost / qty : item.costPerUnit;
 
       // 3. Increment stock & update cost
@@ -438,16 +439,40 @@ app.post('/api/vendors/:vendorId/inventory/:itemId/restock', requireAuth, async 
         }
       });
 
-      // 4. Automatically log this refill to DailyExpense (P&L Ledger)
+      // 4. Log refill to DailyExpense (P&L Ledger)
       if (cost > 0) {
         await tx.dailyExpense.create({
           data: {
-            vendorId: vendorId as string,
+            vendorId: dbVendorId,
             amount: cost,
             category: 'Raw Materials',
             description: `Refilled ${qty} ${item.unit} of ${item.name}`
           }
         });
+      }
+
+      // 5. 🚨 AUTO-RESTORE DISHES: Re-enable dishes if all their recipe ingredients have enough stock
+      const linkedRecipes = await tx.recipeItem.findMany({
+        where: { inventoryItemId: itemId },
+        select: { menuItemId: true }
+      });
+
+      for (const link of linkedRecipes) {
+        const fullRecipe = await tx.recipeItem.findMany({
+          where: { menuItemId: link.menuItemId },
+          include: { inventoryItem: true }
+        });
+
+        const canMakeOne = fullRecipe.every(
+          (r) => r.inventoryItem.currentStock >= r.quantityUsed
+        );
+
+        if (canMakeOne) {
+          await tx.menuItem.update({
+            where: { id: link.menuItemId },
+            data: { available: true }
+          });
+        }
       }
 
       return updated;
@@ -456,19 +481,6 @@ app.post('/api/vendors/:vendorId/inventory/:itemId/restock', requireAuth, async 
     res.json(updatedItem);
   } catch (error: any) {
     res.status(500).json({ error: error.message || "Failed to refill stock" });
-  }
-});
-
-// 4. Fetch linked recipe for a menu item
-app.get('/api/vendors/:vendorId/menu/:itemId/recipe', async (req, res) => {
-  try {
-    const recipe = await prisma.recipeItem.findMany({
-      where: { menuItemId: req.params.itemId as string },
-      include: { inventoryItem: true }
-    });
-    res.json({ recipe });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch dish recipe' });
   }
 });
 
@@ -635,12 +647,16 @@ app.get('/api/vendors/:vendorId/payment/public', async (req, res) => {
 });
 // --------------------------------
 
-// 1. Fetch Menu (Customer View)
+// 1. Fetch Menu (Customer View - sends all items so Sold-Out dishes render with greyscale badge)
 app.get('/api/vendors/:vendorId/menu', async (req, res) => {
-  const { vendorId } = req.params;
   try {
-    // Notice how it only sends items where available: true
-    const items = await prisma.menuItem.findMany({ where: { vendorId, available: true } });
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+
+    const items = await prisma.menuItem.findMany({
+      where: { vendorId: dbVendorId },
+      orderBy: [{ available: 'desc' }, { name: 'asc' }]
+    });
     res.json({ items });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch menu' });
@@ -1115,7 +1131,7 @@ app.post('/api/orders', async (req, res) => {
         }
       });
 
-      // Step F: Decrement Inventory & Trigger Auto-86
+      // Step F: Decrement Inventory & Trigger Exact-Threshold Auto-86
       for (const [inventoryId, demand] of ingredientDemand.entries()) {
         const updatedStock = await tx.inventoryItem.update({
           where: { id: inventoryId },
@@ -1126,23 +1142,22 @@ app.post('/api/orders', async (req, res) => {
 
         console.log(`📉 Stock Decremented: ${updatedStock.name} by ${demand.totalNeeded} ${updatedStock.unit}. Remaining: ${updatedStock.currentStock}`);
 
-        // 🚨 AUTO-86 ENGINE: If stock drops to 0 or below, shut down dependent dishes
-        if (updatedStock.currentStock <= 0) {
-          // Query tx.recipeItem (matches your model RecipeItem exactly)
-          const depletedLinks = await tx.recipeItem.findMany({
-            where: { inventoryItemId: updatedStock.id },
-            select: { menuItemId: true }
+        // 🚨 AUTO-86 ENGINE: Disable any dependent dish where remaining stock < 1 serving
+        const dependentRecipes = await tx.recipeItem.findMany({
+          where: { inventoryItemId: updatedStock.id },
+          select: { menuItemId: true, quantityUsed: true }
+        });
+
+        const dishIdsToDisable = dependentRecipes
+          .filter((r) => updatedStock.currentStock < r.quantityUsed)
+          .map((r) => r.menuItemId);
+
+        if (dishIdsToDisable.length > 0) {
+          await tx.menuItem.updateMany({
+            where: { id: { in: dishIdsToDisable } },
+            data: { available: false }
           });
-
-          const dishIdsToDisable = depletedLinks.map((r) => r.menuItemId);
-
-          if (dishIdsToDisable.length > 0) {
-            await tx.menuItem.updateMany({
-              where: { id: { in: dishIdsToDisable } },
-              data: { available: false }
-            });
-            console.warn(`🛑 AUTO-86 ACTIVATED: Marked ${dishIdsToDisable.length} dishes unavailable due to depleted ${updatedStock.name}`);
-          }
+          console.warn(`🛑 AUTO-86 ACTIVATED: Marked ${dishIdsToDisable.length} dishes unavailable (Remaining ${updatedStock.name}: ${updatedStock.currentStock})`);
         }
       }
 
@@ -1163,12 +1178,15 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
-// 3. Kitchen Queue (Polling Endpoint for KDS)
+// 3. Kitchen Queue (Excludes completed AND cancelled orders)
 app.get('/api/vendors/:vendorId/kitchen-queue', async (req, res) => {
   const { vendorId } = req.params;
   try {
     const orders = await prisma.order.findMany({
-      where: { vendorId, kitchenStatus: { not: 'completed' } },
+      where: {
+        vendorId,
+        kitchenStatus: { notIn: ['completed', 'cancelled', 'rejected'] }
+      },
       include: { items: true },
       orderBy: { createdAt: 'asc' }
     });
@@ -1178,31 +1196,81 @@ app.get('/api/vendors/:vendorId/kitchen-queue', async (req, res) => {
   }
 });
 
-// 4. Update Kitchen Status
+// 4. Update Kitchen Status (Restores Inventory if Cancelled!)
 app.patch('/api/orders/:orderId/kitchen-status', requireAuth, async (req, res) => {
   const { orderId } = req.params;
   const { status } = req.body;
+
   try {
-    const order = await prisma.order.update({
-      where: { id: orderId as string },
-      data: { kitchenStatus: status }
+    const updatedOrder = await prisma.$transaction(async (tx) => {
+      const existingOrder = await tx.order.findUnique({
+        where: { id: orderId as string },
+        include: { items: true }
+      });
+
+      if (!existingOrder) throw new Error('Order not found');
+
+      const isCancelling =
+        (status === 'cancelled' || status === 'rejected') &&
+        existingOrder.kitchenStatus !== 'cancelled' &&
+        existingOrder.kitchenStatus !== 'rejected';
+
+      // 🔄 ROLLBACK INVENTORY IF ORDER IS CANCELLED
+      if (isCancelling) {
+        for (const orderItem of existingOrder.items) {
+          const menuItem = await tx.menuItem.findFirst({
+            where: {
+              vendorId: existingOrder.vendorId,
+              name: { equals: orderItem.name.trim(), mode: 'insensitive' }
+            },
+            include: { recipes: true }
+          });
+
+          if (menuItem && menuItem.recipes.length > 0) {
+            for (const recipe of menuItem.recipes) {
+              const restoreQty = Number(recipe.quantityUsed) * Number(orderItem.qty);
+              const restoredStock = await tx.inventoryItem.update({
+                where: { id: recipe.inventoryItemId },
+                data: { currentStock: { increment: restoreQty } }
+              });
+
+              // Re-enable dish if stock is back above 1 serving requirement
+              if (restoredStock.currentStock >= recipe.quantityUsed) {
+                await tx.menuItem.update({
+                  where: { id: menuItem.id },
+                  data: { available: true }
+                });
+              }
+            }
+          }
+        }
+      }
+
+      return await tx.order.update({
+        where: { id: orderId as string },
+        data: {
+          kitchenStatus: status,
+          status: status
+        }
+      });
     });
-    res.json(order);
+
+    res.json(updatedOrder);
   } catch (error) {
+    console.error("Status Update Error:", error);
     res.status(500).json({ error: 'Failed to update status' });
   }
 });
-
 
 // 4.5 Check Single Order Status (For the Customer Pickup Screen)
 app.get('/api/orders/:orderId/status', async (req, res) => {
   const { orderId } = req.params;
   try {
-    const order = await prisma.order.findUnique({ 
+    const order = await prisma.order.findUnique({
       where: { id: orderId as string },
-      select: { id: true, kitchenStatus: true } // We only need the status
+      select: { id: true, kitchenStatus: true, status: true }
     });
-    
+
     if (!order) return res.status(404).json({ error: 'Order not found' });
     res.json(order);
   } catch (error) {
