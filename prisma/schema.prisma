@@ -40,7 +40,7 @@ model Vendor {
   menuItems    MenuItem[]
   orders       Order[]
   promos       Promo[]
-  paymentData  PaymentData[]
+  paymentData  PaymentData?
 }
 
 // --- UPDATE THESE TWO BLOCKS ---
@@ -100,7 +100,7 @@ model Order {
   vendor        Vendor      @relation(fields: [vendorId], references: [id])
   tableId       String?
   customerName  String      @default("Walk-in")
-  token         Int         @default(autoincrement())
+  token         Int
   status        String      @default("received")
   kitchenStatus String      @default("pending")
   total         Float
@@ -109,6 +109,8 @@ model Order {
   createdAt     DateTime    @default(now())
   
   items         OrderItem[]
+  @@index([vendorId, kitchenStatus, createdAt])
+  @@index([vendorId, createdAt])
 }
 
 model OrderItem {
@@ -150,6 +152,7 @@ model DailyExpense {
   date        DateTime @default(now())
   
   vendor      Vendor   @relation(fields: [vendorId], references: [id])
+  @@index([vendorId, date])
 }
 
 model InventoryItem {
