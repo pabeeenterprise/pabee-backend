@@ -1,6 +1,5 @@
-import { encrypt, decrypt } from './utils/encryption'; // Ensure this is at the top!
+import { encrypt, decrypt } from './utils/encryption';
 import express from 'express';
-import jwt from 'jsonwebtoken';
 import cors from 'cors';
 import { PrismaClient } from '@prisma/client';
 import { Webhook } from 'svix';
@@ -11,17 +10,29 @@ const prisma = new PrismaClient();
 const app = express();
 const requireAuth = ClerkExpressRequireAuth({}) as unknown as express.RequestHandler;
 
+// Helper: Safely resolve Clerk ID (user_...) to Postgres Database UUID
+async function getDbVendorId(idParam: string | string[] | undefined): Promise<string | null> {
+  if (!idParam) return null;
+  const cleanId = Array.isArray(idParam) ? idParam[0] : idParam;
+  if (cleanId.startsWith('user_')) {
+    const vendor = await prisma.vendor.findUnique({ where: { clerkId: cleanId } });
+    return vendor ? vendor.id : null;
+  }
+  return cleanId;
+}
+
 app.use(cors({
   origin: [
-    'http://localhost:5173', // Your local Vite server
-    'http://localhost:3000', 
-    'https://project-r73rm.vercel.app' // 👈 IMPORTANT: live Vercel link here!
+    'http://localhost:5173',
+    'http://localhost:3000',
+    'https://project-r73rm.vercel.app'
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'], // 👈 This is mandatory to let the Clerk token through
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
+// Clerk Webhook (New user registration)
 app.post(
   '/api/webhooks/clerk',
   express.raw({ type: 'application/json' }),
@@ -43,20 +54,19 @@ app.post(
 
     const payload = req.body.toString('utf8');
     const wh = new Webhook(WEBHOOK_SECRET);
-    let evt;
+    let evt: any;
 
     try {
       evt = wh.verify(payload, {
         'svix-id': svix_id,
         'svix-timestamp': svix_timestamp,
         'svix-signature': svix_signature,
-      }) as any;
+      });
     } catch (err: any) {
       console.error('Webhook verification failed:', err.message);
       return res.status(400).json({ error: 'Verification failed' });
     }
 
-    // If it's a new user signup, create their database profile!
     if (evt.type === 'user.created') {
       const { id, email_addresses } = evt.data;
       const primaryEmail = email_addresses[0].email_address;
@@ -68,7 +78,7 @@ app.post(
             email: primaryEmail,
           },
         });
-        console.log(`✅ Database profile created for new vendor: ${primaryEmail}`);
+        console.log(`✅ Database profile created for vendor: ${primaryEmail}`);
       } catch (error) {
         console.error('🔥 Failed to save new vendor to DB:', error);
       }
@@ -80,21 +90,20 @@ app.post(
 
 app.use(express.json());
 
-// --- 🌟 UPDATED AUTO-SEED FUNCTION 🌟 ---
+// Auto-Seed Default Menu for Demonstration
 async function seedDatabase() {
   try {
     const itemCount = await prisma.menuItem.count();
     
     if (itemCount === 0) {
-      console.log("🌱 No menu items found. Injecting default menu...");
+      console.log('🌱 No menu items found. Injecting default menu…');
       
-      // 1. Ensure the vendor exists (won't crash if you already made it in Prisma Studio)
       await prisma.vendor.upsert({
         where: { id: 'spice-street-kitchen' },
         update: {},
         create: {
           id: 'spice-street-kitchen',
-          clerkId: 'dummy_clerk_id_123',     // 👈 ADD THIS LINE
+          clerkId: 'dummy_clerk_id_123',
           email: 'test@spicestreet.com',
           name: 'Spice Street Kitchen',
           businessType: 'Street Food',
@@ -102,7 +111,6 @@ async function seedDatabase() {
         }
       });
 
-      // 2. Inject the missing menu items
       await prisma.menuItem.createMany({
         data: [
           { vendorId: 'spice-street-kitchen', name: 'Pav Bhaji', category: 'Food', price: 80, prep: '10 min', veg: true },
@@ -111,20 +119,17 @@ async function seedDatabase() {
           { vendorId: 'spice-street-kitchen', name: 'Cutting Chai', category: 'Drinks', price: 15, prep: '3 min', veg: true }
         ]
       });
-      console.log("✅ Menu items successfully injected!");
-    } else {
-      console.log(`✅ Database already has ${itemCount} menu items ready to go.`);
+      console.log('✅ Menu items successfully injected!');
     }
   } catch (err) {
-    console.log("Database not ready yet or connection error:", err);
+    console.warn('Database initialization warning:', err);
   }
 }
 seedDatabase();
-// --------------------------------
 
 // --- ⚙️ SETTINGS & PROFILE ROUTES ---
 
-// 1. Get Vendor Profile (Smart Route + Safety Net)
+// 1. Get Vendor Profile
 app.get('/api/vendors/:vendorId/profile', async (req, res) => {
   try {
     let vendor = await prisma.vendor.findFirst({
@@ -140,8 +145,8 @@ app.get('/api/vendors/:vendorId/profile', async (req, res) => {
       vendor = await prisma.vendor.create({
         data: {
           clerkId: req.params.vendorId,
-          name: "My Restaurant", 
-          businessType: "Street Stall",
+          name: 'My Restaurant', 
+          businessType: 'Street Stall',
           email: `${req.params.vendorId}@pending-setup.com` 
         }
       });
@@ -154,25 +159,16 @@ app.get('/api/vendors/:vendorId/profile', async (req, res) => {
   }
 });
 
-// 2. Update Vendor Profile (Settings Page)
+// 2. Update Vendor Profile
 app.patch('/api/vendors/:vendorId/profile', requireAuth, async (req, res) => {
   try {
-    const { name, businessType, address, useLogoAsHeader, logoUrl, dashboardLogoUrl} = req.body;
-    
-    const vendor = await prisma.vendor.findFirst({
-      where: {
-        OR: [ 
-          { clerkId: req.params.vendorId as string },
-          { id: req.params.vendorId as string }
-        ]
-      }
-    });
-
-    if (!vendor) return res.status(404).json({ error: 'Vendor not found' });
+    const { name, businessType, address, useLogoAsHeader, logoUrl, dashboardLogoUrl } = req.body;
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
     const updatedVendor = await prisma.vendor.update({
-      where: { id: vendor.id },
-      data: { name, businessType, address, useLogoAsHeader, logoUrl, dashboardLogoUrl}
+      where: { id: dbVendorId },
+      data: { name, businessType, address, useLogoAsHeader, logoUrl, dashboardLogoUrl }
     });
 
     res.json(updatedVendor);
@@ -181,59 +177,38 @@ app.patch('/api/vendors/:vendorId/profile', requireAuth, async (req, res) => {
   }
 });
 
-// 3. SET OR UPDATE MASTER PIN
+// 3. Set or Update Master PIN
 app.post('/api/vendors/:vendorId/pin', requireAuth, async (req, res) => {
   try {
     const { pin } = req.body;
-    
-    // Basic validation: Must be exactly 4 digits
     if (!pin || !/^\d{4}$/.test(pin)) {
       return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
     }
 
-    // ✅ THIS FIXES THE STRICT TYPING
-const vendor = await prisma.vendor.findFirst({
-  where: {
-    OR: [ 
-      { clerkId: req.params.vendorId as string }, 
-      { id: req.params.vendorId as string } 
-    ]
-  }
-});
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
-    if (!vendor) return res.status(404).json({ error: 'Vendor not found' });
-
-    // Save the PIN to the database
     await prisma.vendor.update({
-      where: { id: vendor.id },
+      where: { id: dbVendorId },
       data: { masterPin: pin }
     });
 
     res.json({ success: true, message: 'Master PIN securely updated' });
   } catch (error) {
-    console.error("PIN Update Error:", error);
     res.status(500).json({ error: 'Failed to update PIN' });
   }
 });
 
-// 4. VERIFY MASTER PIN (The Lock Screen Check)
+// 4. Verify Master PIN
 app.post('/api/vendors/:vendorId/pin/verify', async (req, res) => {
   try {
     const { pin } = req.body;
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
-    // ✅ THIS FIXES THE STRICT TYPING
-const vendor = await prisma.vendor.findFirst({
-  where: {
-    OR: [ 
-      { clerkId: req.params.vendorId as string }, 
-      { id: req.params.vendorId as string } 
-    ]
-  }
-});
-
+    const vendor = await prisma.vendor.findUnique({ where: { id: dbVendorId } });
     if (!vendor) return res.status(404).json({ error: 'Vendor not found' });
 
-    // If the owner hasn't set a PIN yet, default to allowing access or prompt them to set one.
     if (!vendor.masterPin) {
       return res.json({ success: true, isSetupRequired: true }); 
     }
@@ -244,24 +219,22 @@ const vendor = await prisma.vendor.findFirst({
       return res.status(401).json({ success: false, error: 'Incorrect PIN' });
     }
   } catch (error) {
-    console.error("PIN Verification Error:", error);
     res.status(500).json({ error: 'Failed to verify PIN' });
   }
 });
 
 // --- 💰 INVENTORY & DAILY EXPENSES ---
 
-// 1. Log a new morning purchase (Money Out)
+// 1. Log New Purchase (Money Out)
 app.post('/api/vendors/:vendorId/expenses', async (req, res) => {
   try {
     const { amount, category, description } = req.body;
-    
-    // We already know it's a UUID from your frontend logic, but we ensure it matches
-    const vendorId = req.params.vendorId; 
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
     const newExpense = await prisma.dailyExpense.create({
       data: {
-        vendorId: vendorId,
+        vendorId: dbVendorId,
         amount: Number(amount),
         category: category || 'Raw Materials',
         description: description || ''
@@ -270,42 +243,38 @@ app.post('/api/vendors/:vendorId/expenses', async (req, res) => {
 
     res.status(201).json(newExpense);
   } catch (error) {
-    console.error("Expense Log Error:", error);
     res.status(500).json({ error: 'Failed to log inventory expense' });
   }
 });
 
-// 2. Get Today's Profit & Loss (Revenue vs Expenses)
+// 2. Get Today's Profit & Loss
 app.get('/api/vendors/:vendorId/profit/today', async (req, res) => {
   try {
-    const vendorId = req.params.vendorId;
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
-    // Set boundary for exactly midnight today (IST)
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
 
-    // Get Money IN (Completed Orders)
     const todaysOrders = await prisma.order.aggregate({
       where: { 
-        vendorId: vendorId, 
+        vendorId: dbVendorId, 
         createdAt: { gte: startOfToday }, 
         kitchenStatus: 'completed' 
       },
       _sum: { total: true }
     });
 
-    // Get Money OUT (Inventory & Expenses)
     const todaysExpenses = await prisma.dailyExpense.findMany({
       where: { 
-        vendorId: vendorId, 
+        vendorId: dbVendorId, 
         date: { gte: startOfToday } 
       },
       orderBy: { date: 'desc' }
     });
 
-    // Calculate Totals
     const grossRevenue = todaysOrders._sum.total || 0;
-    const totalCost = todaysExpenses.reduce((sum: number, exp: any) => sum + exp.amount, 0);
+    const totalCost = todaysExpenses.reduce((sum, exp) => sum + exp.amount, 0);
     const netProfit = grossRevenue - totalCost;
 
     res.json({
@@ -313,22 +282,23 @@ app.get('/api/vendors/:vendorId/profit/today', async (req, res) => {
       grossRevenue,
       totalCost,
       netProfit,
-      expensesList: todaysExpenses // Send the list back to show on the UI
+      expensesList: todaysExpenses
     });
-
   } catch (error) {
-    console.error("Profit Math Error:", error);
     res.status(500).json({ error: 'Failed to calculate daily profit' });
   }
 });
 
 // --- 📦 INVENTORY & RECIPES MANAGEMENT ---
 
-// 1. Get raw inventory items
+// 1. Get Raw Inventory Items
 app.get('/api/vendors/:vendorId/inventory', async (req, res) => {
   try {
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+
     const items = await prisma.inventoryItem.findMany({
-      where: { vendorId: req.params.vendorId as string },
+      where: { vendorId: dbVendorId },
       orderBy: { name: 'asc' }
     });
     res.json({ items });
@@ -337,7 +307,7 @@ app.get('/api/vendors/:vendorId/inventory', async (req, res) => {
   }
 });
 
-// 2. Create a new raw inventory item (g, ml, pcs)
+// 2. Create Raw Inventory Item
 app.post('/api/vendors/:vendorId/inventory', async (req, res) => {
   try {
     const dbVendorId = await getDbVendorId(req.params.vendorId);
@@ -346,7 +316,6 @@ app.post('/api/vendors/:vendorId/inventory', async (req, res) => {
     const { name, unit, currentStock, minAlert, costPerUnit, totalPurchaseCost } = req.body;
 
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Create the inventory item
       const item = await tx.inventoryItem.create({
         data: {
           vendorId: dbVendorId,
@@ -358,7 +327,6 @@ app.post('/api/vendors/:vendorId/inventory', async (req, res) => {
         }
       });
 
-      // 2. If a purchase cost was entered, record it in the Daily P&L Ledger
       if (Number(totalPurchaseCost) > 0) {
         await tx.dailyExpense.create({
           data: {
@@ -376,22 +344,19 @@ app.post('/api/vendors/:vendorId/inventory', async (req, res) => {
 
     res.json({ success: true, item: result });
   } catch (error) {
-    console.error("Failed to register inventory item:", error);
     res.status(500).json({ error: 'Failed to register inventory item' });
   }
 });
 
-// 3. Link ingredients to a dish (Save Recipe)
+// 3. Link Ingredients to a Dish (Save Recipe)
 app.post('/api/vendors/:vendorId/menu/:itemId/recipe', requireAuth, async (req, res) => {
   try {
-    const { ingredients } = req.body; // Array of { inventoryItemId: string, quantityUsed: number }
+    const { ingredients } = req.body;
 
-    // Clear old recipe associations
     await prisma.recipeItem.deleteMany({
       where: { menuItemId: req.params.itemId as string }
     });
 
-    // Bulk attach new recipe ingredients
     if (Array.isArray(ingredients) && ingredients.length > 0) {
       await prisma.recipeItem.createMany({
         data: ingredients.map((ing: any) => ({
@@ -404,33 +369,42 @@ app.post('/api/vendors/:vendorId/menu/:itemId/recipe', requireAuth, async (req, 
 
     res.json({ success: true, message: 'Recipe configuration saved' });
   } catch (error) {
-    console.error("Recipe Link Error:", error);
     res.status(500).json({ error: 'Failed to link recipe ingredients' });
   }
 });
 
-// POST /api/vendors/:vendorId/inventory/:itemId/restock
+// 🌟 3.1 GET Saved Recipe Ingredients (Required by MenuEditor.tsx)
+app.get('/api/vendors/:vendorId/menu/:itemId/recipe', requireAuth, async (req, res) => {
+  try {
+    const recipe = await prisma.recipeItem.findMany({
+      where: { menuItemId: req.params.itemId as string },
+      include: { inventoryItem: true }
+    });
+    res.json({ recipe });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch recipe configuration' });
+  }
+});
+
+// 4. Refill Stock & Auto-Restore Dependent Dishes
 app.post('/api/vendors/:vendorId/inventory/:itemId/restock', requireAuth, async (req, res) => {
   try {
     const { quantityToAdd, totalPurchaseCost } = req.body;
-    const dbVendorId = await getDbVendorId(req.params.vendorId as string);
-    if (!dbVendorId) return res.status(404).json({ error: "Vendor not found" });
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
     const itemId = req.params.itemId as string;
     const qty = Number(quantityToAdd);
     const cost = Number(totalPurchaseCost);
 
-    if (qty <= 0) return res.status(400).json({ error: "Invalid quantity" });
+    if (qty <= 0) return res.status(400).json({ error: 'Invalid quantity' });
 
     const updatedItem = await prisma.$transaction(async (tx) => {
-      // 1. Fetch existing item
       const item = await tx.inventoryItem.findUnique({ where: { id: itemId } });
-      if (!item) throw new Error("Ingredient not found");
+      if (!item) throw new Error('Ingredient not found');
 
-      // 2. Calculate new cost per unit
       const newCostPerUnit = cost > 0 ? cost / qty : item.costPerUnit;
 
-      // 3. Increment stock & update cost
       const updated = await tx.inventoryItem.update({
         where: { id: itemId },
         data: {
@@ -439,7 +413,6 @@ app.post('/api/vendors/:vendorId/inventory/:itemId/restock', requireAuth, async 
         }
       });
 
-      // 4. Log refill to DailyExpense (P&L Ledger)
       if (cost > 0) {
         await tx.dailyExpense.create({
           data: {
@@ -451,7 +424,7 @@ app.post('/api/vendors/:vendorId/inventory/:itemId/restock', requireAuth, async 
         });
       }
 
-      // 5. 🚨 AUTO-RESTORE DISHES: Re-enable dishes if all their recipe ingredients have enough stock
+      // Check all recipes dependent on this ingredient and restore dishes if possible
       const linkedRecipes = await tx.recipeItem.findMany({
         where: { inventoryItemId: itemId },
         select: { menuItemId: true }
@@ -480,35 +453,34 @@ app.post('/api/vendors/:vendorId/inventory/:itemId/restock', requireAuth, async 
 
     res.json(updatedItem);
   } catch (error: any) {
-    res.status(500).json({ error: error.message || "Failed to refill stock" });
+    res.status(500).json({ error: error.message || 'Failed to refill stock' });
   }
 });
 
 // --- 💳 PAYMENT DATA ROUTES ---
 
-// 1. Save or Update Payment Profile
-// POST/SAVE Vendor Payment Settings
+// 1. Save or Update Payment Profile (Clerk ID Sanitized)
 app.post('/api/vendors/:vendorId/payment', async (req, res) => {
-  const { vendorId } = req.params;
-  const { paymentType, upiId, qrImagePath, razorpayKeyId, razorpayKeySecret, isActive } = req.body;
-
   try {
-    // 🛡️ THE FIX: Encrypt the secret if the vendor typed a new one
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+
+    const { paymentType, upiId, qrImagePath, razorpayKeyId, razorpayKeySecret, isActive } = req.body;
     const secureSecret = razorpayKeySecret ? encrypt(razorpayKeySecret) : undefined;
     const secureUpi = upiId ? encrypt(upiId) : '';
 
-    const updatedPayment = await prisma.paymentData.upsert({
-      where: { vendorId },
+    await prisma.paymentData.upsert({
+      where: { vendorId: dbVendorId },
       update: {
         paymentType,
-        upiId: secureUpi, // Encrypting this too!
+        upiId: secureUpi,
         qrImagePath,
         razorpayKeyId,
-        ...(secureSecret ? { razorpayKeySecret: secureSecret } : {}), // 👈 Save the scrambled string
+        ...(secureSecret ? { razorpayKeySecret: secureSecret } : {}),
         isActive
       },
       create: {
-        vendorId,
+        vendorId: dbVendorId,
         paymentType: paymentType || 'UPI',
         upiId: secureUpi,
         qrImagePath: qrImagePath || '',
@@ -520,114 +492,87 @@ app.post('/api/vendors/:vendorId/payment', async (req, res) => {
     
     res.json({ success: true });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Failed to save payment data" });
+    res.status(500).json({ error: 'Failed to save payment data' });
   }
 });
 
-// 2. Retrieve Decrypted Payment Profile
-// 1. GET Vendor Payment Settings (For the Settings Dashboard)
+// 2. Retrieve Decrypted Payment Profile for Settings
 app.get('/api/vendors/:vendorId/payment', async (req, res) => {
   try {
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+
     const paymentData = await prisma.paymentData.findUnique({
-      where: { vendorId: req.params.vendorId } // 👈 FIX: GET routes use params, not body
+      where: { vendorId: dbVendorId }
     });
     
-    if (!paymentData) return res.status(404).json({ error: "Payment data not found" });
+    if (!paymentData) return res.status(404).json({ error: 'Payment data not found' });
 
-    // Send the data, but completely hide the Secret Key from the internet
     res.json({
       paymentType: paymentData.paymentType,
       upiId: paymentData.upiId,
       qrImagePath: paymentData.qrImagePath,
       razorpayKeyId: paymentData.razorpayKeyId,
-      hasRazorpaySecret: !!paymentData.razorpayKeySecret,
+      hasRazorpaySecret: Boolean(paymentData.razorpayKeySecret),
       isActive: paymentData.isActive
     });
   } catch (error) {
-    res.status(500).json({ error: "Failed to fetch payment data" });
+    res.status(500).json({ error: 'Failed to fetch payment data' });
   }
 });
 
-// 2. POST Create Razorpay Order (For the Customer Checkout Page)
+// 3. Create Razorpay Financial Order
 app.post('/api/checkout/razorpay', async (req, res) => {
   try {
-    const { vendorId, amount } = req.body; // POST routes have a body!
-
+    const { vendorId, amount } = req.body;
     if (!vendorId || amount == null) {
-      return res.status(400).json({ error: "vendorId and amount are required" });
+      return res.status(400).json({ error: 'vendorId and amount are required' });
     }
 
-    // Resolve Clerk ID or database UUID to the vendor record
-    const vendor = await prisma.vendor.findFirst({
-      where: {
-        OR: [
-          { clerkId: vendorId as string },
-          { id: vendorId as string }
-        ]
-      }
-    });
-
-    if (!vendor) {
-      return res.status(404).json({ error: "Vendor not found" });
-    }
+    const dbVendorId = await getDbVendorId(vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
     const paymentData = await prisma.paymentData.findUnique({
-      where: { vendorId: vendor.id }
+      where: { vendorId: dbVendorId }
     });
 
-    if (!paymentData) {
-      return res.status(404).json({ error: "Payment data not found" });
-    }
-
-    // 🛡️ The Safety Block: Prevent null crashes
-    if (!paymentData.razorpayKeyId || !paymentData.razorpayKeySecret) {
-      return res.status(400).json({ error: "This restaurant has not configured Razorpay correctly." });
+    if (!paymentData || !paymentData.razorpayKeyId || !paymentData.razorpayKeySecret) {
+      return res.status(400).json({ error: 'Restaurant has not configured Razorpay correctly.' });
     }
     
     const unscrambledSecret = decrypt(paymentData.razorpayKeySecret);
-    // Initialize the Razorpay engine
     const razorpay = new Razorpay({
       key_id: paymentData.razorpayKeyId,
       key_secret: unscrambledSecret
     });
 
-    // Ask Razorpay to create a financial order
     const options = {
-      amount: Math.round(amount * 100), // Razorpay demands paise (₹1 = 100 paise)
-      currency: "INR",
+      amount: Math.round(amount * 100),
+      currency: 'INR',
       receipt: `receipt_${Date.now()}`
     };
 
     const order = await razorpay.orders.create(options);
-    res.json(order); // Send the official order ID back to the React frontend
-
+    res.json(order);
   } catch (error) {
-    console.error("Razorpay Error:", error);
-    res.status(500).json({ error: "Failed to create Razorpay order" });
+    res.status(500).json({ error: 'Failed to create Razorpay order' });
   }
 });
 
-// 3. Retrieve Public Payment Profile (For Customer Checkout)
+// 4. Retrieve Public Payment Config for Customer Checkout
 app.get('/api/vendors/:vendorId/payment/public', async (req, res) => {
   try {
-    const vendor = await prisma.vendor.findFirst({
-      where: {
-        OR: [
-          { clerkId: req.params.vendorId as string },
-          { id: req.params.vendorId as string }
-        ]
-      },
-      include: {
-        paymentData: true 
-      }
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+
+    const vendor = await prisma.vendor.findUnique({
+      where: { id: dbVendorId },
+      include: { paymentData: true }
     });
 
-    // 🛡️ THE FIX: Extract the first payment profile from the array
     const rawPaymentData = vendor?.paymentData;
     const activePaymentConfig = Array.isArray(rawPaymentData) ? rawPaymentData[0] : rawPaymentData;
 
-    // If no payment data exists in the array, or the toggle is off -> Disable UPI
     if (!activePaymentConfig || !activePaymentConfig.isActive) {
       return res.json({ available: false });
     }
@@ -641,13 +586,13 @@ app.get('/api/vendors/:vendorId/payment/public', async (req, res) => {
       razorpayKeyId: activePaymentConfig.razorpayKeyId
     });
   } catch (error) {
-    console.error("Public Payment Error:", error);
     res.status(500).json({ error: 'Failed to retrieve public payment data' });
   }
 });
-// --------------------------------
 
-// 1. Fetch Menu (Customer View - sends all items so Sold-Out dishes render with greyscale badge)
+// --- 📋 MENU ROUTES ---
+
+// 1. Fetch Customer Menu (Includes depleted dishes so they render with Sold-Out badges)
 app.get('/api/vendors/:vendorId/menu', async (req, res) => {
   try {
     const dbVendorId = await getDbVendorId(req.params.vendorId);
@@ -663,23 +608,12 @@ app.get('/api/vendors/:vendorId/menu', async (req, res) => {
   }
 });
 
-// --- MENU EDITOR ROUTES ---
-
-// 1.1 Get ALL Menu Items (Including hidden ones for the Editor)
-// 1. THE BULLETPROOF GET ROUTE
+// 2. Fetch Menu for Menu Editor
 app.get('/api/vendors/:vendorId/menu-editor', async (req, res) => {
   try {
-    const idParam = req.params.vendorId;
-    let dbVendorId = idParam;
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
-    // If the frontend passes a Clerk ID (starts with user_), translate it.
-    if (idParam.startsWith('user_')) {
-      const vendor = await prisma.vendor.findUnique({ where: { clerkId: idParam } });
-      if (!vendor) return res.status(404).json({ error: "Vendor not found." });
-      dbVendorId = vendor.id;
-    }
-
-    // Fetch using the true Postgres UUID
     const items = await prisma.menuItem.findMany({ 
       where: { vendorId: dbVendorId },
       orderBy: { category: 'asc' }
@@ -687,23 +621,15 @@ app.get('/api/vendors/:vendorId/menu-editor', async (req, res) => {
     
     res.json({ items });
   } catch (error) {
-    console.error("🚨 FETCH MENU ERROR:", error);
-    res.status(500).json({ error: 'Failed to fetch menu' });
+    res.status(500).json({ error: 'Failed to fetch editor menu' });
   }
 });
 
-// 2. THE BULLETPROOF POST ROUTE
+// 3. Create Menu Item
 app.post('/api/vendors/:vendorId/menu', async (req, res) => {
   try {
-    const idParam = req.params.vendorId;
-    let dbVendorId = idParam;
-
-    // If the frontend passes a Clerk ID, translate it.
-    if (idParam.startsWith('user_')) {
-      const vendor = await prisma.vendor.findUnique({ where: { clerkId: idParam } });
-      if (!vendor) return res.status(404).json({ error: "Vendor not found." });
-      dbVendorId = vendor.id;
-    }
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
     const newItem = await prisma.menuItem.create({
       data: {
@@ -719,23 +645,22 @@ app.post('/api/vendors/:vendorId/menu', async (req, res) => {
         emoji: req.body.emoji || null,
         remarks: req.body.remarks || null,
         badgeLabel: req.body.badgeLabel || null,
-        vendorId: dbVendorId // 👈 Now uses the correct database UUID guaranteed
+        vendorId: dbVendorId
       }
     });
 
     res.status(201).json(newItem);
   } catch (error) {
-    console.error("🚨 DATABASE CREATION FAILED:", error);
-    res.status(500).json({ error: "Failed to save to database" });
+    res.status(500).json({ error: 'Failed to save menu item' });
   }
 });
 
-// 1.3 Update Item (Edit details or toggle In-Stock/Out-of-Stock)
+// 4. Update Menu Item
 app.patch('/api/vendors/:vendorId/menu/:itemId', requireAuth, async (req, res) => {
   try {
     const updatedItem = await prisma.menuItem.update({
       where: { id: req.params.itemId as string },
-      data: req.body // Prisma is smart enough to only update the fields provided
+      data: req.body
     });
     res.json(updatedItem);
   } catch (error) {
@@ -743,7 +668,7 @@ app.patch('/api/vendors/:vendorId/menu/:itemId', requireAuth, async (req, res) =
   }
 });
 
-// 1.4 Delete Item
+// 5. Delete Menu Item
 app.delete('/api/vendors/:vendorId/menu/:itemId', requireAuth, async (req, res) => {
   try {
     await prisma.menuItem.delete({ where: { id: req.params.itemId as string } });
@@ -753,31 +678,22 @@ app.delete('/api/vendors/:vendorId/menu/:itemId', requireAuth, async (req, res) 
   }
 });
 
-
 // --- 🎟️ OFFERS & PROMOS ROUTES ---
 
-// Helper function to safely get the true Postgres Database ID
-async function getDbVendorId(idParam: string) {
-  if (idParam.startsWith('user_')) {
-    const vendor = await prisma.vendor.findUnique({ where: { clerkId: idParam } });
-    return vendor ? vendor.id : null;
-  }
-  return idParam;
-}
-
-// 1. Get all promos
+// 1. Get Promos
 app.get('/api/vendors/:vendorId/promos', async (req, res) => {
   try {
     const dbVendorId = await getDbVendorId(req.params.vendorId);
     if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+
     const now = new Date();
     const promos = await prisma.promo.findMany({
       where: { 
         vendorId: dbVendorId,
         isActive: true,
         OR: [
-          { expiresAt: null },       // Never expires
-          { expiresAt: { gt: now } } // Expiration date is in the future
+          { expiresAt: null },
+          { expiresAt: { gt: now } }
         ]
       },
       orderBy: { createdAt: 'desc' }
@@ -788,19 +704,18 @@ app.get('/api/vendors/:vendorId/promos', async (req, res) => {
   }
 });
 
-// 2. Create a new promo (NATIVE UPSERT)
+// 2. Create or Update Promo
 app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
   try {
     const dbVendorId = await getDbVendorId(req.params.vendorId as string);
     if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
-    const { code, type, value, minOrderValue, maxUses, expiresAt, isActive, applyTo } = req.body;
+    const { code, type, value, minOrderValue, maxUses, expiresAt, applyTo } = req.body;
     const cleanCode = code.trim().toUpperCase();
 
-    // 🌟 NATIVE PRISMA UPSERT: Atomically updates if exists, creates if it doesn't.
     const savedPromo = await prisma.promo.upsert({
       where: {
-        vendorId_code: { // 👈 This targets your @@unique constraint directly
+        vendorId_code: {
           vendorId: dbVendorId,
           code: cleanCode
         }
@@ -811,8 +726,8 @@ app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
         minOrderValue: Number(minOrderValue || 0),
         maxUses: maxUses ? Number(maxUses) : null,
         expiresAt: expiresAt ? new Date(expiresAt) : null,
-        isActive: true, // Always revive it
-        applyTo: applyTo || "ALL"
+        isActive: true,
+        applyTo: applyTo || 'ALL'
       },
       create: {
         vendorId: dbVendorId,
@@ -823,19 +738,17 @@ app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
         maxUses: maxUses ? Number(maxUses) : null,
         expiresAt: expiresAt ? new Date(expiresAt) : null,
         isActive: true,
-        applyTo: applyTo || "ALL"
+        applyTo: applyTo || 'ALL'
       }
     });
     
     res.json(savedPromo);
-
   } catch (error: any) {
-    console.error("Promo error:", error);
-    res.status(500).json({ error: `DEBUG INFO: ${error.message || String(error)}` });
+    res.status(500).json({ error: error.message || 'Failed to save promo' });
   }
 });
 
-// 3. Delete a promo
+// 3. Delete Promo
 app.delete('/api/vendors/:vendorId/promos/:promoId', async (req, res) => {
   try {
     await prisma.promo.delete({ where: { id: req.params.promoId } });
@@ -845,16 +758,13 @@ app.delete('/api/vendors/:vendorId/promos/:promoId', async (req, res) => {
   }
 });
 
-// 4. 🛑 VERIFY A PROMO (THE ADVANCED CHECKOUT MATH)
+// 4. Verify Promo at Checkout
 app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
   try {
     const dbVendorId = await getDbVendorId(req.params.vendorId);
     if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
-    // 🌟 CHANGED: We now require the full cart array to check categories
     const { code, cartItems } = req.body; 
-    
-    // Calculate total cart value
     const cartTotal = cartItems.reduce((sum: number, item: any) => sum + (item.price * item.qty), 0);
     
     const promo = await prisma.promo.findFirst({
@@ -866,11 +776,9 @@ app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
     if (promo.expiresAt && new Date() > promo.expiresAt) return res.status(400).json({ error: 'This promo code has expired.' });
     if (promo.maxUses !== null && promo.currentUses >= promo.maxUses) return res.status(400).json({ error: 'Usage limit reached.' });
 
-    // 🌟 THE NEW CATEGORY FILTER MATH
     let eligibleTotal = cartTotal;
 
-    if (promo.applyTo !== "ALL") {
-      // Sum up ONLY the items that match the target category (e.g., "Chaat")
+    if (promo.applyTo !== 'ALL') {
       eligibleTotal = cartItems
         .filter((item: any) => item.category === promo.applyTo || item.name === promo.applyTo)
         .reduce((sum: number, item: any) => sum + (item.price * item.qty), 0);
@@ -880,10 +788,9 @@ app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
       }
     }
 
-    // Calculate discount against the ELIGIBLE total, not the whole cart
     let discountAmount = 0;
     if (promo.type === 'FLAT') {
-      discountAmount = Math.min(promo.value, eligibleTotal); // Don't discount more than the eligible items cost
+      discountAmount = Math.min(promo.value, eligibleTotal);
     } else if (promo.type === 'PERCENTAGE' || promo.type === 'Percentage discount (%)') {
       discountAmount = (eligibleTotal * promo.value) / 100;
     }
@@ -894,37 +801,34 @@ app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
       discountAmount: Math.round(discountAmount), 
       newTotal: Math.round(cartTotal - discountAmount) 
     });
-
   } catch (error) {
-    console.error("Verification error:", error);
     res.status(500).json({ error: 'Failed to verify promo.' });
   }
 });
 
-// --- 📊 ADVANCED ANALYTICS ROUTE (TypeScript Safe!) ---
+// --- 📊 ANALYTICS ROUTE ---
 app.get('/api/vendors/:vendorId/analytics', requireAuth, async (req, res) => {
   try {
+    const dbVendorId = await getDbVendorId(req.params.vendorId as string);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+
     const today = new Date();
     const thirtyDaysAgo = new Date();
     thirtyDaysAgo.setDate(today.getDate() - 30);
 
-    // FIX 1: Add include: { items: true } so Prisma actually fetches the food items!
     const orders = await prisma.order.findMany({
       where: {
-        vendorId: req.params.vendorId as string,
-        createdAt: { gte: thirtyDaysAgo},
+        vendorId: dbVendorId,
+        createdAt: { gte: thirtyDaysAgo },
         kitchenStatus: 'completed'
       },
-      include: {
-        items: true 
-      }
+      include: { items: true }
     });
 
     const totalOrders = orders.length;
     let totalRevenue = 0;
     let upi = 0, cash = 0, card = 0;
 
-    // Added (o: any) to satisfy TypeScript
     orders.forEach((o: any) => {
       totalRevenue += o.total;
       if (o.paymentMode === 'UPI') upi++;
@@ -935,16 +839,10 @@ app.get('/api/vendors/:vendorId/analytics', requireAuth, async (req, res) => {
     const avgOrder = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
     const calcPercent = (val: number) => totalOrders > 0 ? Math.round((val / totalOrders) * 100) : 0;
 
-    // ==========================================
-    // ==========================================
-    // 🧠 3. THE ADVANCED MATH: Top Items
-    // ==========================================
     const itemTracker: Record<string, any> = {};
-    
     orders.forEach((order: any) => {
       const items = Array.isArray(order.items) ? order.items : [];
       items.forEach((item: any) => {
-        // 👇 Group by NAME instead of ID to merge duplicates!
         if (!itemTracker[item.name]) {
           itemTracker[item.name] = { id: item.id, name: item.name, rev: 0, sold: 0 };
         }
@@ -961,30 +859,19 @@ app.get('/api/vendors/:vendorId/analytics', requireAuth, async (req, res) => {
         rev: item.rev.toLocaleString('en-IN')
       }));
 
-    // ==========================================
-    // 📈 4. THE ADVANCED MATH: 30-Day Trend
-    // ==========================================
-    let dailyRevenue = new Array(30).fill(0);
-    
+    const dailyRevenue = new Array(30).fill(0);
     orders.forEach((order: any) => {
-      // FIX 4: Use .getTime() so TypeScript can subtract the dates properly
       const diffTime = Math.abs(today.getTime() - new Date(order.createdAt).getTime());
       const daysAgo = Math.floor(diffTime / (1000 * 60 * 60 * 24));
-      
       if (daysAgo < 30) {
-        const arrayIndex = 29 - daysAgo; 
-        dailyRevenue[arrayIndex] += order.total;
+        dailyRevenue[29 - daysAgo] += order.total;
       }
     });
 
     const maxDaily = Math.max(...dailyRevenue, 1);
     const trend = dailyRevenue.map(rev => Math.round((rev / maxDaily) * 100));
 
-    // ==========================================
-    // ⏰ 5. THE ADVANCED MATH: Peak Hours
-    // ==========================================
     const hourBuckets = { morning: 0, lunch: 0, evening: 0, night: 0 };
-    
     orders.forEach((order: any) => {
       const hour = new Date(order.createdAt).getHours(); 
       if (hour >= 9 && hour < 12) hourBuckets.morning++;
@@ -1006,7 +893,7 @@ app.get('/api/vendors/:vendorId/analytics', requireAuth, async (req, res) => {
     res.json({
       revenue: totalRevenue.toLocaleString('en-IN'),
       orders: totalOrders,
-      avgOrder: avgOrder,
+      avgOrder,
       rating: 4.8, 
       paymentSplit: [
         { label: 'UPI / QR', percentage: calcPercent(upi), color: 'bg-blue-500' },
@@ -1017,51 +904,37 @@ app.get('/api/vendors/:vendorId/analytics', requireAuth, async (req, res) => {
       topItems,
       trend
     });
-
   } catch (error) {
-    console.error("Analytics Error:", error);
     res.status(500).json({ error: 'Failed to fetch analytics' });
   }
 });
 
-// 2. Create Order (Checkout)
+// --- 🛍️ ORDER & CHECKOUT ENGINE ---
+
+// Create Order (Atomic Stock Decrement & Auto-86)
 app.post('/api/orders', async (req, res) => {
   try {
     const { vendorId, tableId, customerName, items, total, paymentMode, customerPhone } = req.body;
-
-    const vendor = await prisma.vendor.findFirst({
-      where: {
-        OR: [
-          { clerkId: vendorId },
-          { id: vendorId }
-        ]
-      }
-    });
-
-    if (!vendor) {
-      return res.status(404).json({ error: "Vendor not found to attach order to." });
-    }
+    const dbVendorId = await getDbVendorId(vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found to attach order to.' });
 
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
 
-    // 🚨 ATOMIC TRANSACTION
     const newOrder = await prisma.$transaction(async (tx) => {
-      // Step A: Token generation
       const lastOrder = await tx.order.findFirst({
         where: {
-          vendorId: vendor.id,
+          vendorId: dbVendorId,
           createdAt: { gte: startOfToday },
         },
         orderBy: { token: 'desc' },
       });
       const nextToken = lastOrder?.token ? lastOrder.token + 1 : 1;
 
-      // Step B: Fetch all ordered menu items with their recipes in ONE query
       const cartItemNames = items.map((i: any) => i.name.trim());
       const menuItems = await tx.menuItem.findMany({
         where: {
-          vendorId: vendor.id,
+          vendorId: dbVendorId,
           name: { in: cartItemNames, mode: 'insensitive' }
         },
         include: {
@@ -1071,8 +944,6 @@ app.post('/api/orders', async (req, res) => {
         }
       });
 
-      // Step C: Aggregate total demand per raw ingredient across the entire cart
-      // Map: inventoryItemId -> { item, totalNeeded, dishNames }
       const ingredientDemand = new Map<string, { item: any; totalNeeded: number; dishNames: string[] }>();
 
       for (const cartItem of items) {
@@ -1099,8 +970,7 @@ app.post('/api/orders', async (req, res) => {
         }
       }
 
-      // Step D: Pre-Validate Aggregated Stock (Prevents Negative Stock)
-      for (const [inventoryId, demand] of ingredientDemand.entries()) {
+      for (const [, demand] of ingredientDemand.entries()) {
         if (demand.item.currentStock < demand.totalNeeded) {
           const shortageError: any = new Error(
             `Insufficient stock for "${demand.item.name}". Required: ${demand.totalNeeded} ${demand.item.unit}, Available: ${demand.item.currentStock} ${demand.item.unit}. Affects: ${demand.dishNames.join(', ')}.`
@@ -1110,16 +980,15 @@ app.post('/api/orders', async (req, res) => {
         }
       }
 
-      // Step E: Create Order
       const createdOrder = await tx.order.create({
         data: {
-          vendorId: vendor.id,
+          vendorId: dbVendorId,
           token: nextToken,
-          customerName: customerName || "Counter Order",
-          customerPhone: customerPhone || "0000000000",
-          paymentMode: paymentMode,
-          tableId: tableId || "Counter",
-          total: total,
+          customerName: customerName || 'Counter Order',
+          customerPhone: customerPhone || '0000000000',
+          paymentMode,
+          tableId: tableId || 'Counter',
+          total,
           kitchenStatus: 'pending',
           items: {
             create: items.map((cartItem: any) => ({
@@ -1131,7 +1000,6 @@ app.post('/api/orders', async (req, res) => {
         }
       });
 
-      // Step F: Decrement Inventory & Trigger Exact-Threshold Auto-86
       for (const [inventoryId, demand] of ingredientDemand.entries()) {
         const updatedStock = await tx.inventoryItem.update({
           where: { id: inventoryId },
@@ -1140,9 +1008,6 @@ app.post('/api/orders', async (req, res) => {
           }
         });
 
-        console.log(`📉 Stock Decremented: ${updatedStock.name} by ${demand.totalNeeded} ${updatedStock.unit}. Remaining: ${updatedStock.currentStock}`);
-
-        // 🚨 AUTO-86 ENGINE: Disable any dependent dish where remaining stock < 1 serving
         const dependentRecipes = await tx.recipeItem.findMany({
           where: { inventoryItemId: updatedStock.id },
           select: { menuItemId: true, quantityUsed: true }
@@ -1157,7 +1022,6 @@ app.post('/api/orders', async (req, res) => {
             where: { id: { in: dishIdsToDisable } },
             data: { available: false }
           });
-          console.warn(`🛑 AUTO-86 ACTIVATED: Marked ${dishIdsToDisable.length} dishes unavailable (Remaining ${updatedStock.name}: ${updatedStock.currentStock})`);
         }
       }
 
@@ -1165,26 +1029,23 @@ app.post('/api/orders', async (req, res) => {
     });
 
     res.status(201).json({ id: newOrder.id, tokenNumber: newOrder.token.toString() });
-
   } catch (error: any) {
-    console.error("🔥 ORDER CHECKOUT ERROR:", error.message || error);
-    
-    // Return clean 400 for stock shortages instead of crashing with 500
     if (error.statusCode === 400) {
       return res.status(400).json({ error: error.message });
     }
-
-    res.status(500).json({ error: "Failed to create order" });
+    res.status(500).json({ error: 'Failed to create order' });
   }
 });
 
-// 3. Kitchen Queue (Excludes completed AND cancelled orders)
+// Kitchen Queue (Excludes completed and cancelled orders)
 app.get('/api/vendors/:vendorId/kitchen-queue', async (req, res) => {
-  const { vendorId } = req.params;
   try {
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+
     const orders = await prisma.order.findMany({
       where: {
-        vendorId,
+        vendorId: dbVendorId,
         kitchenStatus: { notIn: ['completed', 'cancelled', 'rejected'] }
       },
       include: { items: true },
@@ -1196,7 +1057,7 @@ app.get('/api/vendors/:vendorId/kitchen-queue', async (req, res) => {
   }
 });
 
-// 4. Update Kitchen Status (Restores Inventory if Cancelled!)
+// Update Kitchen Status (Restores inventory if cancelled)
 app.patch('/api/orders/:orderId/kitchen-status', requireAuth, async (req, res) => {
   const { orderId } = req.params;
   const { status } = req.body;
@@ -1215,7 +1076,6 @@ app.patch('/api/orders/:orderId/kitchen-status', requireAuth, async (req, res) =
         existingOrder.kitchenStatus !== 'cancelled' &&
         existingOrder.kitchenStatus !== 'rejected';
 
-      // 🔄 ROLLBACK INVENTORY IF ORDER IS CANCELLED
       if (isCancelling) {
         for (const orderItem of existingOrder.items) {
           const menuItem = await tx.menuItem.findFirst({
@@ -1234,7 +1094,6 @@ app.patch('/api/orders/:orderId/kitchen-status', requireAuth, async (req, res) =
                 data: { currentStock: { increment: restoreQty } }
               });
 
-              // Re-enable dish if stock is back above 1 serving requirement
               if (restoredStock.currentStock >= recipe.quantityUsed) {
                 await tx.menuItem.update({
                   where: { id: menuItem.id },
@@ -1250,24 +1109,22 @@ app.patch('/api/orders/:orderId/kitchen-status', requireAuth, async (req, res) =
         where: { id: orderId as string },
         data: {
           kitchenStatus: status,
-          status: status
+          status
         }
       });
     });
 
     res.json(updatedOrder);
   } catch (error) {
-    console.error("Status Update Error:", error);
     res.status(500).json({ error: 'Failed to update status' });
   }
 });
 
-// 4.5 Check Single Order Status (For the Customer Pickup Screen)
+// Check Single Order Status (For Customer Tracker)
 app.get('/api/orders/:orderId/status', async (req, res) => {
-  const { orderId } = req.params;
   try {
     const order = await prisma.order.findUnique({
-      where: { id: orderId as string },
+      where: { id: req.params.orderId as string },
       select: { id: true, kitchenStatus: true, status: true }
     });
 
@@ -1278,7 +1135,7 @@ app.get('/api/orders/:orderId/status', async (req, res) => {
   }
 });
 
-// 5. Send OTP (MOCKED FOR DEVELOPMENT)
+// Mock OTP Send
 app.post('/api/otp/send', async (req, res) => {
   const { phone } = req.body;
   if (!phone) {
@@ -1286,107 +1143,40 @@ app.post('/api/otp/send', async (req, res) => {
   }
 
   let formattedPhone = phone.replace(/\D/g, ''); 
+  if (formattedPhone.length === 10) formattedPhone = `91${formattedPhone}`;
 
-  if (formattedPhone.length === 10) {
-    formattedPhone = `91${formattedPhone}`;
-  }
-
-  // 🌟 THE MISSING LINE: Instantly tell the frontend it was a "success"
-  console.log(`[MOCK] Pretending to send OTP to ${formattedPhone}`);
   return res.json({ sent: true, phone: formattedPhone });
-
- /* const authKey = process.env.MSG91_AUTH_KEY;
-  const templateId = process.env.MSG91_TEMPLATE_ID;
-
-  if (!authKey || !templateId) {
-    console.error("Missing MSG91 Configuration Environment Variables.");
-    return res.status(500).json({ error: 'SMS Gateway configuration error' });
-  }
-
-  try {
-    const response = await fetch(`https://control.msg91.com/api/v5/otp?template_id=${templateId}&mobile=${formattedPhone}`, {
-      method: 'POST',
-      headers: {
-        'authkey': authKey,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    const data = await response.json();
-
-    if (response.ok && data.type === 'success') {
-      return res.json({ sent: true, phone: formattedPhone });
-    } else {
-      console.error("MSG91 Error Response:", data);
-      return res.status(response.status).json({ error: data.message || 'Failed to send OTP via gateway' });
-    }
-  } catch (error) {
-    console.error("Network Error communicating with MSG91:", error);
-    return res.status(500).json({ error: 'Internal server error communicating with SMS gateway' });
-  }*/
 });
 
-// 6. Verify OTP (MOCKED FOR DEVELOPMENT)
+// Mock OTP Verify
 app.post('/api/otp/verify', async (req, res) => {
   const { phone, otp } = req.body;
-
   if (!phone || !otp) {
     return res.status(400).json({ error: 'Phone number and OTP are both required' });
   }
 
   const formattedPhone = phone.replace(/\D/g, '');
-
-  // 🌟 MOCK VERIFY: Use "1234" as the universal test password
   if (otp === '1234' || otp === '123456') {
-    console.log(`[MOCK] Successfully verified OTP for ${formattedPhone}`);
     return res.json({ verified: true, phone: formattedPhone });
   } else {
     return res.status(400).json({ error: 'Invalid mock OTP code. Please use 1234.' });
   }
- /* const authKey = process.env.MSG91_AUTH_KEY;
-
-  if (!authKey) {
-    return res.status(500).json({ error: 'SMS Gateway configuration error' });
-  }
-
-  try {
-    const response = await fetch(`https://control.msg91.com/api/v5/otp/verify?otp=${otp}&mobile=${formattedPhone}`, {
-      method: 'GET',
-      headers: {
-        'authkey': authKey
-      }
-    });
-
-    const data = await response.json();
-
-    if (response.ok && data.type === 'success') {
-      return res.json({ verified: true, phone: formattedPhone });
-    } else {
-      console.error("MSG91 Verification Failure:", data);
-      return res.status(400).json({ error: data.message || 'Invalid or expired OTP code' });
-    }
-  } catch (error) {
-    console.error("Network Error during MSG91 verification:", error);
-    return res.status(500).json({ error: 'Internal server error verifying token code' });
-  } */
 });
 
-// 7. Get Vendor Sales Dashboard Data
+// Completed Sales Records for History & Reports
 app.get('/api/vendors/:vendorId/sales', requireAuth, async (req, res) => {
-  const { vendorId } = req.params;
   try {
-    // Fetch all completed orders
+    const dbVendorId = await getDbVendorId(req.params.vendorId as string);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+
     const orders = await prisma.order.findMany({
-      where: { vendorId: vendorId as string, kitchenStatus: 'completed' },
-      include: { items: true }, // 👈 CRUCIAL: Include the items for the "Top Selling" calculation!
-      orderBy: { createdAt: 'desc' }, // Newest first
+      where: { vendorId: dbVendorId, kitchenStatus: 'completed' },
+      include: { items: true },
+      orderBy: { createdAt: 'desc' },
     });
 
-    // 3. Send it back EXACTLY how the frontend Overview tab expects it
-    res.json({ orders: orders }); 
-    
+    res.json({ orders }); 
   } catch (error) {
-    console.error("Sales Endpoint Error:", error);
     res.status(500).json({ error: 'Failed to fetch sales data' });
   }
 });
@@ -1394,16 +1184,12 @@ app.get('/api/vendors/:vendorId/sales', requireAuth, async (req, res) => {
 // --- 🎨 BRANDING STUDIO ROUTES ---
 
 app.get('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
-  const vendorId = String(req.params.vendorId);
-
   try {
-    const vendor = await prisma.vendor.findFirst({
-      where: {
-        OR: [
-          { clerkId: vendorId },
-          { id: vendorId }
-        ]
-      }
+    const dbVendorId = await getDbVendorId(req.params.vendorId as string);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor profile not found' });
+
+    const vendor = await prisma.vendor.findUnique({
+      where: { id: dbVendorId }
     });
 
     if (!vendor) return res.status(404).json({ error: 'Vendor profile not found' });
@@ -1420,37 +1206,26 @@ app.get('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error("Branding query failed:", error);
     return res.status(500).json({ error: 'Internal server failure' });
   }
 });
 
 app.patch('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
-  const vendorId = String(req.params.vendorId);
-  // 1. EXTRACT NEW FIELDS
-  const { themeMode, accentColor, fontFamily, buttonRoundness, logoUrl, bannerUrl, showOfferStrip, offerText } = req.body;
-
   try {
-    const vendor = await prisma.vendor.findFirst({
-      where: {
-        OR: [
-          { clerkId: vendorId },
-          { id: vendorId }
-        ]
-      }
-    });
+    const dbVendorId = await getDbVendorId(req.params.vendorId as string);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
-    if (!vendor) return res.status(404).json({ error: 'Vendor not found' });
+    const { themeMode, accentColor, fontFamily, buttonRoundness, logoUrl, bannerUrl, showOfferStrip, offerText } = req.body;
 
     const updatedVendor = await prisma.vendor.update({
-      where: { id: vendor.id }, 
+      where: { id: dbVendorId }, 
       data: { 
         themeMode, 
         accentColor, 
         fontFamily,
         buttonRoundness,
-        showOfferStrip, // 2. SAVE TO DB
-        offerText,      // 2. SAVE TO DB
+        showOfferStrip,
+        offerText,
         ...(logoUrl && { logoUrl }), 
         ...(bannerUrl && { bannerUrl }) 
       } as any 
@@ -1463,21 +1238,20 @@ app.patch('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
         accentColor: (updatedVendor as any).accentColor, 
         fontFamily: (updatedVendor as any).fontFamily,
         buttonRoundness: (updatedVendor as any).buttonRoundness,
-        showOfferStrip: (updatedVendor as any).showOfferStrip, // 3. RETURN TO UI
-        offerText: (updatedVendor as any).offerText,           // 3. RETURN TO UI
+        showOfferStrip: (updatedVendor as any).showOfferStrip,
+        offerText: (updatedVendor as any).offerText,
         logoUrl: updatedVendor.logoUrl, 
         bannerUrl: updatedVendor.bannerUrl 
       }
     });
   } catch (error) {
-    console.error("Branding update failed:", error);
     return res.status(500).json({ error: 'Failed to update branding settings' });
   }
 });
 
 // --- 🚨 GLOBAL ERROR CATCHER ---
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  console.error("🔥 Server Error:", err.message || err);
+  console.error('🔥 Server Error:', err.message || err);
   
   if (err.message === 'Unauthenticated' || err.message.includes('token')) {
     return res.status(401).json({ error: 'Unauthorized: Invalid or expired session token' });
