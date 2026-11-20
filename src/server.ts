@@ -1125,7 +1125,7 @@ app.get('/api/orders/:orderId/status', async (req, res) => {
   try {
     const order = await prisma.order.findUnique({
       where: { id: req.params.orderId as string },
-      select: { id: true, kitchenStatus: true, status: true }
+      select: { id: true, token: true, kitchenStatus: true, status: true }
     });
 
     if (!order) return res.status(404).json({ error: 'Order not found' });
