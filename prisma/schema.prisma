@@ -18,7 +18,7 @@ model Vendor {
   expenses         DailyExpense[]
   inventoryItems   InventoryItem[]
   businessType String?    
-  address      String?  // 👈 ADD THIS EXACT LINE RIGHT HERE
+  address      String?  
 
   tier         Int        @default(1)
   defaultTable String     @default("Counter")
@@ -27,10 +27,10 @@ model Vendor {
   dashboardLogoUrl String?  // Replaces the "pabee Admin" text in the sidebar
   logoUrl         String?    // Optional: URL for their uploaded logo
   bannerUrl       String?    // Optional: URL for the top banner image
-  accentColor     String     @default("#E5B35C") // 👈 Changed from primaryColor to match frontend
-  themeMode       String     @default("dark")    // 👈 Changed from theme to match frontend
-  fontFamily      String     @default("font-sans")    // 👈 ADDED NEW
-  buttonRoundness String     @default("rounded-xl")   // 👈 ADDED NEW
+  accentColor     String     @default("#E5B35C") 
+  themeMode       String     @default("dark")    
+  fontFamily      String     @default("font-sans")    
+  buttonRoundness String     @default("rounded-xl")   
   storeName       String     @default("Unnamed Store")
   useLogoAsHeader Boolean  @default(false) // Toggle: false = text, true = image
   showOfferStrip Boolean @default(false)
@@ -53,12 +53,12 @@ model PaymentData {
   paymentType       PaymentType @default(UPI)
 
   // --- UPI Details ---
-  upiId             String?     // 👈 ADDED ?: Must be optional if they use Razorpay instead
+  upiId             String?      
   qrImagePath       String?
 
   // --- 🌟 NEW: Razorpay Gateway ---
-  razorpayKeyId     String?     // 👈 ADDED: Public Test/Live Key
-  razorpayKeySecret String?     // 👈 ADDED: Secret Test/Live Key
+  razorpayKeyId     String?     
+  razorpayKeySecret String?      
 
   isActive          Boolean     @default(true)
   createdAt         DateTime    @default(now())
@@ -67,7 +67,7 @@ model PaymentData {
 
 enum PaymentType {
   UPI
-  RAZORPAY // 👈 ADDED: Razorpay as an official database option
+  RAZORPAY 
 }
 
 model MenuItem {
@@ -92,6 +92,7 @@ model MenuItem {
 
   createdAt    DateTime @default(now())
   updatedAt    DateTime @default(now()) @updatedAt
+  @@index([vendorId, available])
 }
 
 model Order {
@@ -120,6 +121,7 @@ model OrderItem {
   name      String
   qty       Int
   price     Float
+  @@index([orderId])
 }
 
 // --- NEW PROMO TABLE ---
@@ -181,4 +183,5 @@ model RecipeItem {
   inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
 
   @@unique([menuItemId, inventoryItemId])
+  @@index([inventoryItemId])
 }
