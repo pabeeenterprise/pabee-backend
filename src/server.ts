@@ -32,6 +32,11 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
+// Keep-alive probe. No auth, no database — safe for an external pinger.
+app.get('/api/health', (_req, res) => {
+  res.status(200).json({ ok: true, ts: Date.now() });
+});
+
 // Clerk Webhook (New user registration)
 app.post(
   '/api/webhooks/clerk',
