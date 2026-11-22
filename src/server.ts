@@ -5,9 +5,11 @@ import { PrismaClient } from '@prisma/client';
 import { Webhook } from 'svix';
 import { ClerkExpressRequireAuth } from '@clerk/clerk-sdk-node';
 import Razorpay from 'razorpay';
+import compression from 'compression';
 
 const prisma = new PrismaClient();
 const app = express();
+app.use(compression());
 const requireAuth = ClerkExpressRequireAuth({}) as unknown as express.RequestHandler;
 
 // Helper: Safely resolve Clerk ID (user_...) to Postgres Database UUID
@@ -1174,13 +1176,42 @@ app.get('/api/vendors/:vendorId/sales', requireAuth, async (req, res) => {
     const dbVendorId = await getDbVendorId(req.params.vendorId as string);
     if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
+    const requestedDays = Number(req.query.days);
+    const days = Number.isFinite(requestedDays) && requestedDays > 0
+      ? Math.min(Math.floor(requestedDays), 90)
+      : 30;
+
+    // +1 day buffer prevents IST (UTC+5:30) midnight boundary clipping
+    const since = new Date(Date.now() - (days + 1) * 86400000);
+
     const orders = await prisma.order.findMany({
-      where: { vendorId: dbVendorId, kitchenStatus: 'completed' },
-      include: { items: true },
+      where: {
+        vendorId: dbVendorId,
+        kitchenStatus: 'completed',
+        createdAt: { gte: since },
+      },
+      select: {
+        id: true,
+        token: true,
+        total: true,
+        paymentMode: true,
+        kitchenStatus: true,
+        customerName: true,
+        customerPhone: true,
+        tableId: true,
+        createdAt: true,
+        items: {
+          select: {
+            name: true,
+            qty: true,
+            price: true,
+          },
+        },
+      },
       orderBy: { createdAt: 'desc' },
     });
 
-    res.json({ orders }); 
+    res.json({ orders });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch sales data' });
   }
