@@ -1,51 +1,144 @@
-import { encrypt, decrypt } from './utils/encryption';
-import express from 'express';
+import crypto from 'crypto';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
+import compression from 'compression';
 import { PrismaClient } from '@prisma/client';
 import { Webhook } from 'svix';
 import { ClerkExpressRequireAuth } from '@clerk/clerk-sdk-node';
 import Razorpay from 'razorpay';
-import compression from 'compression';
+import { encrypt, decrypt } from './utils/encryption';
+
+interface AuthedRequest extends Request {
+  auth?: { userId?: string | null };
+  vendorId?: string;
+}
 
 const prisma = new PrismaClient();
 const app = express();
+const PACKING_FEE_INR = 10;
+
 app.use(compression());
+
 const requireAuth = ClerkExpressRequireAuth({}) as unknown as express.RequestHandler;
 
-// Helper: Safely resolve Clerk ID (user_...) to Postgres Database UUID
-async function getDbVendorId(idParam: string | string[] | undefined): Promise<string | null> {
-  if (!idParam) return null;
-  const cleanId = Array.isArray(idParam) ? idParam[0] : idParam;
-  if (cleanId.startsWith('user_')) {
-    const vendor = await prisma.vendor.findUnique({ where: { clerkId: cleanId } });
-    return vendor ? vendor.id : null;
-  }
-  return cleanId;
+// Helper: Safely extract a single string param across Express type versions
+function paramStr(val: string | string[] | undefined): string {
+  if (!val) return '';
+  return Array.isArray(val) ? String(val[0] || '') : String(val);
 }
 
-app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:3000',
-    'https://project-r73rm.vercel.app'
-  ],
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-}));
+// Helper: Resolve Clerk ID or DB UUID (USED ONLY ON PUBLIC CUSTOMER ROUTES)
+async function getDbVendorId(idParam: string | string[] | undefined): Promise<string | null> {
+  const cleanId = paramStr(idParam).trim();
+  if (!cleanId) return null;
+  if (cleanId.startsWith('user_')) {
+    const vendor = await prisma.vendor.findUnique({
+      where: { clerkId: cleanId },
+      select: { id: true },
+    });
+    return vendor ? vendor.id : null;
+  }
+  const vendor = await prisma.vendor.findUnique({
+    where: { id: cleanId },
+    select: { id: true },
+  });
+  return vendor ? vendor.id : null;
+}
 
-// Keep-alive probe. No auth, no database — safe for an external pinger.
+// Helper: Safely decrypt legacy plaintext or encrypted UPI strings
+function safeDecrypt(value: string | null | undefined): string {
+  if (!value) return '';
+  try {
+    return decrypt(value);
+  } catch {
+    return value;
+  }
+}
+
+// Helper: Salted scrypt PIN hashing (supports seamless upgrade from legacy 4-digit PINs)
+function hashPin(pin: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(pin, salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+}
+
+function verifyPin(pin: string, stored: string): { valid: boolean; needsUpgrade: boolean } {
+  if (!stored.includes(':')) {
+    const a = Buffer.from(pin);
+    const b = Buffer.from(stored);
+    const valid = a.length === b.length && crypto.timingSafeEqual(a, b);
+    return { valid, needsUpgrade: valid };
+  }
+  const [salt, keyHex] = stored.split(':');
+  if (!salt || !keyHex) return { valid: false, needsUpgrade: false };
+  const derived = crypto.scryptSync(pin, salt, 64);
+  const storedBuf = Buffer.from(keyHex, 'hex');
+  const valid = derived.length === storedBuf.length && crypto.timingSafeEqual(derived, storedBuf);
+  return { valid, needsUpgrade: false };
+}
+
+// Strict Clerk-only tenant ownership middleware
+async function requireVendorOwner(req: AuthedRequest, res: Response, next: NextFunction) {
+  try {
+    const clerkUserId = req.auth?.userId;
+    if (!clerkUserId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const ownedVendor = await prisma.vendor.findUnique({
+      where: { clerkId: clerkUserId },
+      select: { id: true, clerkId: true },
+    });
+
+    if (!ownedVendor) {
+      return res.status(403).json({ error: 'Vendor profile not initialized' });
+    }
+
+    const urlVendorId = paramStr(req.params.vendorId);
+    if (urlVendorId && urlVendorId !== ownedVendor.id && urlVendorId !== ownedVendor.clerkId) {
+      return res.status(403).json({ error: 'Forbidden: vendor ownership mismatch' });
+    }
+
+    req.vendorId = ownedVendor.id;
+    return next();
+  } catch (err) {
+    return next(err);
+  }
+}
+
+// Env-driven CORS (add your new custom domain to ALLOWED_ORIGINS in Render)
+const defaultOrigins = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'https://project-r73rm.vercel.app',
+];
+const envOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+const allowedOrigins = Array.from(new Set([...defaultOrigins, ...envOrigins]));
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error(`CORS blocked origin: ${origin}`));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
+
+// Keep-alive probe (No auth, no DB)
 app.get('/api/health', (_req, res) => {
   res.status(200).json({ ok: true, ts: Date.now() });
 });
 
-// Clerk Webhook (New user registration)
+// Clerk Webhook (MUST stay before express.json() so Svix verifies raw bytes)
 app.post(
   '/api/webhooks/clerk',
   express.raw({ type: 'application/json' }),
   async (req, res) => {
     const WEBHOOK_SECRET = process.env.CLERK_WEBHOOK_SECRET;
-    
     if (!WEBHOOK_SECRET) {
       console.error('Missing CLERK_WEBHOOK_SECRET in .env');
       return res.status(500).json({ error: 'Server configuration error' });
@@ -76,18 +169,17 @@ app.post(
 
     if (evt.type === 'user.created') {
       const { id, email_addresses } = evt.data;
-      const primaryEmail = email_addresses[0].email_address;
+      const primaryEmail = email_addresses?.[0]?.email_address || `${id}@pending-setup.com`;
 
       try {
-        await prisma.vendor.create({
-          data: {
-            clerkId: id,
-            email: primaryEmail,
-          },
+        await prisma.vendor.upsert({
+          where: { clerkId: id },
+          update: { email: primaryEmail },
+          create: { clerkId: id, email: primaryEmail },
         });
-        console.log(`✅ Database profile created for vendor: ${primaryEmail}`);
+        console.log(`Database profile synced for vendor: ${primaryEmail}`);
       } catch (error) {
-        console.error('🔥 Failed to save new vendor to DB:', error);
+        console.error('Failed to save new vendor to DB:', error);
       }
     }
 
@@ -97,14 +189,12 @@ app.post(
 
 app.use(express.json());
 
-// Auto-Seed Default Menu for Demonstration
+// Auto-Seed Default Menu for empty fresh databases
 async function seedDatabase() {
   try {
     const itemCount = await prisma.menuItem.count();
-    
     if (itemCount === 0) {
-      console.log('🌱 No menu items found. Injecting default menu…');
-      
+      console.log('No menu items found. Injecting default menu…');
       await prisma.vendor.upsert({
         where: { id: 'spice-street-kitchen' },
         update: {},
@@ -115,7 +205,7 @@ async function seedDatabase() {
           name: 'Spice Street Kitchen',
           businessType: 'Street Food',
           tier: 1,
-        }
+        },
       });
 
       await prisma.menuItem.createMany({
@@ -123,10 +213,9 @@ async function seedDatabase() {
           { vendorId: 'spice-street-kitchen', name: 'Pav Bhaji', category: 'Food', price: 80, prep: '10 min', veg: true },
           { vendorId: 'spice-street-kitchen', name: 'Vada Pav', category: 'Snacks', price: 25, prep: '5 min', veg: true },
           { vendorId: 'spice-street-kitchen', name: 'Chicken Wrap', category: 'Non-veg', price: 120, prep: '12 min', veg: false },
-          { vendorId: 'spice-street-kitchen', name: 'Cutting Chai', category: 'Drinks', price: 15, prep: '3 min', veg: true }
-        ]
+          { vendorId: 'spice-street-kitchen', name: 'Cutting Chai', category: 'Drinks', price: 15, prep: '3 min', veg: true },
+        ],
       });
-      console.log('✅ Menu items successfully injected!');
     }
   } catch (err) {
     console.warn('Database initialization warning:', err);
@@ -134,472 +223,627 @@ async function seedDatabase() {
 }
 seedDatabase();
 
-// --- ⚙️ SETTINGS & PROFILE ROUTES ---
+// --- SERVER-SIDE CART & PRICING ENGINE ---
 
-// 1. Get Vendor Profile
+interface VerifiedCartItem {
+  menuItemId: string;
+  name: string;
+  category: string;
+  price: number;
+  qty: number;
+  recipes: Array<{
+    inventoryItemId: string;
+    quantityUsed: number;
+    inventoryItem: { id: string; name: string; unit: string; currentStock: number };
+  }>;
+}
+
+async function calculateVerifiedCart(
+  tx: Pick<PrismaClient, 'menuItem' | 'promo'>,
+  dbVendorId: string,
+  rawItems: any[],
+  promoCode?: string,
+  packIt = false
+) {
+  if (!Array.isArray(rawItems) || rawItems.length === 0) {
+    throw Object.assign(new Error('Cart cannot be empty'), { statusCode: 400 });
+  }
+
+  const requested = rawItems.map((i) => ({
+    id: i?.menuItemId || i?.id ? String(i.menuItemId || i.id) : null,
+    name: i?.name ? String(i.name).trim() : '',
+    qty: Math.floor(Number(i?.qty)),
+  }));
+
+  if (requested.some((r) => !Number.isFinite(r.qty) || r.qty <= 0 || r.qty > 50)) {
+    throw Object.assign(new Error('Invalid item quantity'), { statusCode: 400 });
+  }
+
+  const ids = requested.map((r) => r.id).filter((x): x is string => Boolean(x));
+  const names = requested.filter((r) => !r.id && r.name).map((r) => r.name);
+
+  const dbItems = await tx.menuItem.findMany({
+    where: {
+      vendorId: dbVendorId,
+      available: true,
+      OR: [
+        ...(ids.length ? [{ id: { in: ids } }] : []),
+        ...(names.length ? [{ name: { in: names, mode: 'insensitive' as const } }] : []),
+      ],
+    },
+    include: {
+      recipes: { include: { inventoryItem: true } },
+    },
+  });
+
+  const verifiedItems: VerifiedCartItem[] = requested.map((reqItem) => {
+    const match = reqItem.id
+      ? dbItems.find((d) => d.id === reqItem.id)
+      : dbItems.find((d) => d.name.toLowerCase() === reqItem.name.toLowerCase());
+
+    if (!match) {
+      throw Object.assign(
+        new Error(`Item "${reqItem.name || reqItem.id}" is unavailable or invalid`),
+        { statusCode: 400 }
+      );
+    }
+
+    return {
+      menuItemId: match.id,
+      name: match.name,
+      category: match.category,
+      price: Number(match.price),
+      qty: reqItem.qty,
+      recipes: match.recipes.map((r) => ({
+        inventoryItemId: r.inventoryItemId,
+        quantityUsed: Number(r.quantityUsed),
+        inventoryItem: {
+          id: r.inventoryItem.id,
+          name: r.inventoryItem.name,
+          unit: r.inventoryItem.unit,
+          currentStock: Number(r.inventoryItem.currentStock),
+        },
+      })),
+    };
+  });
+
+  const subtotal = verifiedItems.reduce((sum, item) => sum + item.price * item.qty, 0);
+  let discountAmount = 0;
+  let appliedPromo: { id: string; maxUses: number | null } | null = null;
+
+  if (promoCode && String(promoCode).trim()) {
+    const cleanCode = String(promoCode).trim().toUpperCase();
+    const promo = await tx.promo.findFirst({
+      where: { vendorId: dbVendorId, code: cleanCode },
+    });
+
+    if (!promo || !promo.isActive) {
+      throw Object.assign(new Error('Invalid or inactive promo code.'), { statusCode: 400 });
+    }
+    if (subtotal < promo.minOrderValue) {
+      throw Object.assign(new Error(`Cart must be at least ₹${promo.minOrderValue}.`), { statusCode: 400 });
+    }
+    if (promo.expiresAt && new Date() > promo.expiresAt) {
+      throw Object.assign(new Error('This promo code has expired.'), { statusCode: 400 });
+    }
+    if (promo.maxUses !== null && promo.currentUses >= promo.maxUses) {
+      throw Object.assign(new Error('Usage limit reached.'), { statusCode: 400 });
+    }
+
+    let eligibleTotal = subtotal;
+    if (promo.applyTo !== 'ALL') {
+      eligibleTotal = verifiedItems
+        .filter((item) => item.category === promo.applyTo || item.name === promo.applyTo)
+        .reduce((sum, item) => sum + item.price * item.qty, 0);
+
+      if (eligibleTotal === 0) {
+        throw Object.assign(new Error(`This code only applies to ${promo.applyTo}.`), { statusCode: 400 });
+      }
+    }
+
+    if (promo.type === 'FLAT') {
+      discountAmount = Math.min(promo.value, eligibleTotal);
+    } else if (promo.type === 'PERCENTAGE' || promo.type === 'Percentage discount (%)') {
+      discountAmount = (eligibleTotal * promo.value) / 100;
+    }
+
+    discountAmount = Math.round(discountAmount);
+    appliedPromo = { id: promo.id, maxUses: promo.maxUses };
+  }
+
+  const packingFee = packIt ? PACKING_FEE_INR : 0;
+  const finalTotal = Math.max(0, Math.round(subtotal - discountAmount + packingFee));
+  return { verifiedItems, subtotal, discountAmount, packingFee, finalTotal, appliedPromo };
+}
+
+// --- SETTINGS & PROFILE ROUTES ---
+
+// 1. Authenticated Vendor Bootstrap (Replaces unauthenticated auto-create)
+app.get('/api/vendor/me', requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const clerkUserId = req.auth?.userId;
+    if (!clerkUserId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const vendor = await prisma.vendor.upsert({
+      where: { clerkId: clerkUserId },
+      update: {},
+      create: {
+        clerkId: clerkUserId,
+        name: 'My Restaurant',
+        businessType: 'Street Stall',
+        email: `${clerkUserId}@pending-setup.com`,
+      },
+      select: {
+        id: true,
+        name: true,
+        businessType: true,
+        address: true,
+        email: true,
+        logoUrl: true,
+        dashboardLogoUrl: true,
+        useLogoAsHeader: true,
+        masterPin: true,
+      },
+    });
+
+    const { masterPin, ...safeVendor } = vendor;
+    return res.json({ ...safeVendor, hasMasterPin: Boolean(masterPin) });
+  } catch {
+    return res.status(500).json({ error: 'Failed to load vendor session' });
+  }
+});
+
+// 2. Public Storefront Profile (Read-only, public branding fields ONLY — no PIN/email/clerkId)
 app.get('/api/vendors/:vendorId/profile', async (req, res) => {
   try {
-    let vendor = await prisma.vendor.findFirst({
-      where: {
-        OR: [
-          { clerkId: req.params.vendorId },
-          { id: req.params.vendorId }
-        ]
-      }
+    const dbVendorId = await getDbVendorId(req.params.vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor profile not found' });
+
+    const vendor = await prisma.vendor.findUnique({
+      where: { id: dbVendorId },
+      select: {
+        id: true,
+        name: true,
+        businessType: true,
+        logoUrl: true,
+        bannerUrl: true,
+        useLogoAsHeader: true,
+        accentColor: true,
+        themeMode: true,
+        fontFamily: true,
+        buttonRoundness: true,
+        showOfferStrip: true,
+        offerText: true,
+      },
     });
-    
-    if (!vendor && req.params.vendorId.startsWith('user_')) {
-      vendor = await prisma.vendor.create({
-        data: {
-          clerkId: req.params.vendorId,
-          name: 'My Restaurant', 
-          businessType: 'Street Stall',
-          email: `${req.params.vendorId}@pending-setup.com` 
-        }
-      });
-    }
 
     if (!vendor) return res.status(404).json({ error: 'Vendor profile not found' });
-    res.json(vendor);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch vendor profile' });
+    return res.json(vendor);
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch vendor profile' });
   }
 });
 
-// 2. Update Vendor Profile
-app.patch('/api/vendors/:vendorId/profile', requireAuth, async (req, res) => {
+// 3. Update Vendor Profile (Owner-Scoped)
+app.patch('/api/vendors/:vendorId/profile', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
     const { name, businessType, address, useLogoAsHeader, logoUrl, dashboardLogoUrl } = req.body;
-    const dbVendorId = await getDbVendorId(req.params.vendorId);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
     const updatedVendor = await prisma.vendor.update({
-      where: { id: dbVendorId },
-      data: { name, businessType, address, useLogoAsHeader, logoUrl, dashboardLogoUrl }
+      where: { id: req.vendorId! },
+      data: { name, businessType, address, useLogoAsHeader, logoUrl, dashboardLogoUrl },
+      select: {
+        id: true,
+        name: true,
+        businessType: true,
+        address: true,
+        useLogoAsHeader: true,
+        logoUrl: true,
+        dashboardLogoUrl: true,
+      },
     });
-
-    res.json(updatedVendor);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update store profile' });
+    return res.json(updatedVendor);
+  } catch {
+    return res.status(500).json({ error: 'Failed to update store profile' });
   }
 });
 
-// 3. Set or Update Master PIN
-app.post('/api/vendors/:vendorId/pin', requireAuth, async (req, res) => {
+// 4. Set or Update Master PIN (Salted scrypt)
+app.post('/api/vendors/:vendorId/pin', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const { pin } = req.body;
-    if (!pin || !/^\d{4}$/.test(pin)) {
+    const pin = String(req.body.pin || '');
+    if (!/^\d{4}$/.test(pin)) {
       return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
     }
-
-    const dbVendorId = await getDbVendorId(req.params.vendorId);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
     await prisma.vendor.update({
-      where: { id: dbVendorId },
-      data: { masterPin: pin }
+      where: { id: req.vendorId! },
+      data: { masterPin: hashPin(pin) },
     });
-
-    res.json({ success: true, message: 'Master PIN securely updated' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update PIN' });
+    return res.json({ success: true, message: 'Master PIN securely updated' });
+  } catch {
+    return res.status(500).json({ error: 'Failed to update PIN' });
   }
 });
 
-// 4. Verify Master PIN
-app.post('/api/vendors/:vendorId/pin/verify', async (req, res) => {
+// 5. Verify Master PIN (Owner-Scoped + auto-upgrades legacy plaintext PINs)
+app.post('/api/vendors/:vendorId/pin/verify', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const { pin } = req.body;
-    const dbVendorId = await getDbVendorId(req.params.vendorId);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
-    const vendor = await prisma.vendor.findUnique({ where: { id: dbVendorId } });
+    const pin = String(req.body.pin || '');
+    const vendor = await prisma.vendor.findUnique({
+      where: { id: req.vendorId! },
+      select: { masterPin: true },
+    });
     if (!vendor) return res.status(404).json({ error: 'Vendor not found' });
+    if (!vendor.masterPin) return res.json({ success: true, isSetupRequired: true });
 
-    if (!vendor.masterPin) {
-      return res.json({ success: true, isSetupRequired: true }); 
-    }
+    const { valid, needsUpgrade } = verifyPin(pin, vendor.masterPin);
+    if (!valid) return res.status(401).json({ success: false, error: 'Incorrect PIN' });
 
-    if (vendor.masterPin === pin) {
-      return res.json({ success: true });
-    } else {
-      return res.status(401).json({ success: false, error: 'Incorrect PIN' });
+    if (needsUpgrade) {
+      await prisma.vendor.update({
+        where: { id: req.vendorId! },
+        data: { masterPin: hashPin(pin) },
+      });
     }
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to verify PIN' });
+    return res.json({ success: true });
+  } catch {
+    return res.status(500).json({ error: 'Failed to verify PIN' });
   }
 });
 
-// --- 💰 INVENTORY & DAILY EXPENSES ---
+// --- INVENTORY & DAILY EXPENSES ---
 
-// 1. Log New Purchase (Money Out)
-app.post('/api/vendors/:vendorId/expenses', async (req, res) => {
+app.post('/api/vendors/:vendorId/expenses', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const { amount, category, description } = req.body;
-    const dbVendorId = await getDbVendorId(req.params.vendorId);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
+    const amount = Number(req.body.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Expense amount must be a positive number' });
+    }
     const newExpense = await prisma.dailyExpense.create({
       data: {
-        vendorId: dbVendorId,
-        amount: Number(amount),
-        category: category || 'Raw Materials',
-        description: description || ''
-      }
+        vendorId: req.vendorId!,
+        amount,
+        category: req.body.category || 'Raw Materials',
+        description: req.body.description || '',
+      },
     });
-
-    res.status(201).json(newExpense);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to log inventory expense' });
+    return res.status(201).json(newExpense);
+  } catch {
+    return res.status(500).json({ error: 'Failed to log inventory expense' });
   }
 });
 
-// 2. Get Today's Profit & Loss
-app.get('/api/vendors/:vendorId/profit/today', async (req, res) => {
+app.get('/api/vendors/:vendorId/profit/today', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const dbVendorId = await getDbVendorId(req.params.vendorId);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
 
-    const todaysOrders = await prisma.order.aggregate({
-      where: { 
-        vendorId: dbVendorId, 
-        createdAt: { gte: startOfToday }, 
-        kitchenStatus: 'completed' 
-      },
-      _sum: { total: true }
-    });
-
-    const todaysExpenses = await prisma.dailyExpense.findMany({
-      where: { 
-        vendorId: dbVendorId, 
-        date: { gte: startOfToday } 
-      },
-      orderBy: { date: 'desc' }
-    });
+    const [todaysOrders, todaysExpenses] = await Promise.all([
+      prisma.order.aggregate({
+        where: { vendorId: req.vendorId!, createdAt: { gte: startOfToday }, kitchenStatus: 'completed' },
+        _sum: { total: true },
+      }),
+      prisma.dailyExpense.findMany({
+        where: { vendorId: req.vendorId!, date: { gte: startOfToday } },
+        orderBy: { date: 'desc' },
+      }),
+    ]);
 
     const grossRevenue = todaysOrders._sum.total || 0;
     const totalCost = todaysExpenses.reduce((sum, exp) => sum + exp.amount, 0);
-    const netProfit = grossRevenue - totalCost;
-
-    res.json({
+    return res.json({
       success: true,
       grossRevenue,
       totalCost,
-      netProfit,
-      expensesList: todaysExpenses
+      netProfit: grossRevenue - totalCost,
+      expensesList: todaysExpenses,
     });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to calculate daily profit' });
+  } catch {
+    return res.status(500).json({ error: 'Failed to calculate daily profit' });
   }
 });
 
-// --- 📦 INVENTORY & RECIPES MANAGEMENT ---
+// --- INVENTORY & RECIPES MANAGEMENT ---
 
-// 1. Get Raw Inventory Items
-app.get('/api/vendors/:vendorId/inventory', async (req, res) => {
+app.get('/api/vendors/:vendorId/inventory', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const dbVendorId = await getDbVendorId(req.params.vendorId);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
     const items = await prisma.inventoryItem.findMany({
-      where: { vendorId: dbVendorId },
-      orderBy: { name: 'asc' }
+      where: { vendorId: req.vendorId! },
+      orderBy: { name: 'asc' },
     });
-    res.json({ items });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch inventory' });
+    return res.json({ items });
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch inventory' });
   }
 });
 
-// 2. Create Raw Inventory Item
-app.post('/api/vendors/:vendorId/inventory', async (req, res) => {
+app.post('/api/vendors/:vendorId/inventory', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const dbVendorId = await getDbVendorId(req.params.vendorId);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
     const { name, unit, currentStock, minAlert, costPerUnit, totalPurchaseCost } = req.body;
-
     const result = await prisma.$transaction(async (tx) => {
       const item = await tx.inventoryItem.create({
         data: {
-          vendorId: dbVendorId,
-          name: name.trim(),
+          vendorId: req.vendorId!,
+          name: String(name || '').trim(),
           unit,
           currentStock: Number(currentStock) || 0,
           minAlert: Number(minAlert) || 0,
-          costPerUnit: Number(costPerUnit) || 0
-        }
+          costPerUnit: Number(costPerUnit) || 0,
+        },
       });
 
       if (Number(totalPurchaseCost) > 0) {
         await tx.dailyExpense.create({
           data: {
-            vendorId: dbVendorId,
-            description: `Initial Stock: ${name.trim()} (${currentStock} ${unit})`,
+            vendorId: req.vendorId!,
+            description: `Initial Stock: ${item.name} (${currentStock} ${unit})`,
             amount: Number(totalPurchaseCost),
             category: 'INVENTORY_PURCHASE',
-            date: new Date()
-          }
+            date: new Date(),
+          },
         });
       }
-
       return item;
     });
-
-    res.json({ success: true, item: result });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to register inventory item' });
+    return res.json({ success: true, item: result });
+  } catch {
+    return res.status(500).json({ error: 'Failed to register inventory item' });
   }
 });
 
-// 3. Link Ingredients to a Dish (Save Recipe)
-app.post('/api/vendors/:vendorId/menu/:itemId/recipe', requireAuth, async (req, res) => {
+app.post('/api/vendors/:vendorId/menu/:itemId/recipe', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const { ingredients } = req.body;
+    const menuItemId = paramStr(req.params.itemId);
+    const ingredients: Array<{ inventoryItemId: string; quantityUsed: number }> =
+      Array.isArray(req.body.ingredients) ? req.body.ingredients : [];
 
-    await prisma.recipeItem.deleteMany({
-      where: { menuItemId: req.params.itemId as string }
+    // 1. Verify dish belongs to vendor
+    const dish = await prisma.menuItem.findFirst({
+      where: { id: menuItemId, vendorId: req.vendorId! },
+      select: { id: true },
     });
+    if (!dish) return res.status(404).json({ error: 'Menu item not found' });
 
-    if (Array.isArray(ingredients) && ingredients.length > 0) {
-      await prisma.recipeItem.createMany({
-        data: ingredients.map((ing: any) => ({
-          menuItemId: req.params.itemId as string,
-          inventoryItemId: ing.inventoryItemId,
-          quantityUsed: Number(ing.quantityUsed)
-        }))
+    // 2. Verify EVERY ingredient belongs to this vendor
+    const invIds = [...new Set(ingredients.map((i) => String(i.inventoryItemId)))];
+    if (invIds.length > 0) {
+      const ownedCount = await prisma.inventoryItem.count({
+        where: { id: { in: invIds }, vendorId: req.vendorId! },
       });
+      if (ownedCount !== invIds.length) {
+        return res.status(403).json({ error: 'One or more ingredients do not belong to your stall' });
+      }
     }
 
-    res.json({ success: true, message: 'Recipe configuration saved' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to link recipe ingredients' });
-  }
-});
-
-// 🌟 3.1 GET Saved Recipe Ingredients (Required by MenuEditor.tsx)
-app.get('/api/vendors/:vendorId/menu/:itemId/recipe', requireAuth, async (req, res) => {
-  try {
-    const recipe = await prisma.recipeItem.findMany({
-      where: { menuItemId: req.params.itemId as string },
-      include: { inventoryItem: true }
+    await prisma.$transaction(async (tx) => {
+      await tx.recipeItem.deleteMany({ where: { menuItemId } });
+      if (ingredients.length > 0) {
+        await tx.recipeItem.createMany({
+          data: ingredients.map((ing) => ({
+            menuItemId,
+            inventoryItemId: String(ing.inventoryItemId),
+            quantityUsed: Number(ing.quantityUsed),
+          })),
+        });
+      }
     });
-    res.json({ recipe });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch recipe configuration' });
+
+    return res.json({ success: true, message: 'Recipe configuration saved' });
+  } catch {
+    return res.status(500).json({ error: 'Failed to link recipe ingredients' });
   }
 });
 
-// 4. Refill Stock & Auto-Restore Dependent Dishes
-app.post('/api/vendors/:vendorId/inventory/:itemId/restock', requireAuth, async (req, res) => {
+app.get('/api/vendors/:vendorId/menu/:itemId/recipe', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const { quantityToAdd, totalPurchaseCost } = req.body;
-    const dbVendorId = await getDbVendorId(req.params.vendorId);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+    const menuItemId = paramStr(req.params.itemId);
+    const dish = await prisma.menuItem.findFirst({
+      where: { id: menuItemId, vendorId: req.vendorId! },
+      select: { id: true },
+    });
+    if (!dish) return res.status(404).json({ error: 'Menu item not found' });
 
-    const itemId = req.params.itemId as string;
-    const qty = Number(quantityToAdd);
-    const cost = Number(totalPurchaseCost);
+    const recipe = await prisma.recipeItem.findMany({
+      where: { menuItemId },
+      include: { inventoryItem: true },
+    });
+    return res.json({ recipe });
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch recipe configuration' });
+  }
+});
 
-    if (qty <= 0) return res.status(400).json({ error: 'Invalid quantity' });
+app.post('/api/vendors/:vendorId/inventory/:itemId/restock', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
+  try {
+    const itemId = paramStr(req.params.itemId);
+    const qty = Number(req.body.quantityToAdd);
+    const cost = Number(req.body.totalPurchaseCost);
+    if (!Number.isFinite(qty) || qty <= 0) {
+      return res.status(400).json({ error: 'Invalid quantity' });
+    }
 
     const updatedItem = await prisma.$transaction(async (tx) => {
-      const item = await tx.inventoryItem.findUnique({ where: { id: itemId } });
-      if (!item) throw new Error('Ingredient not found');
+      const item = await tx.inventoryItem.findFirst({
+        where: { id: itemId, vendorId: req.vendorId! },
+      });
+      if (!item) throw Object.assign(new Error('Ingredient not found'), { statusCode: 404 });
 
       const newCostPerUnit = cost > 0 ? cost / qty : item.costPerUnit;
-
-      const updated = await tx.inventoryItem.update({
-        where: { id: itemId },
-        data: {
-          currentStock: { increment: qty },
-          costPerUnit: newCostPerUnit
-        }
+      const resUpdate = await tx.inventoryItem.updateMany({
+        where: { id: itemId, vendorId: req.vendorId! },
+        data: { currentStock: { increment: qty }, costPerUnit: newCostPerUnit },
       });
+      if (resUpdate.count !== 1) throw Object.assign(new Error('Ingredient not found'), { statusCode: 404 });
 
       if (cost > 0) {
         await tx.dailyExpense.create({
           data: {
-            vendorId: dbVendorId,
+            vendorId: req.vendorId!,
             amount: cost,
             category: 'Raw Materials',
-            description: `Refilled ${qty} ${item.unit} of ${item.name}`
-          }
+            description: `Refilled ${qty} ${item.unit} of ${item.name}`,
+          },
         });
       }
 
-      // Check all recipes dependent on this ingredient and restore dishes if possible
       const linkedRecipes = await tx.recipeItem.findMany({
         where: { inventoryItemId: itemId },
-        select: { menuItemId: true }
+        select: { menuItemId: true },
       });
 
       for (const link of linkedRecipes) {
         const fullRecipe = await tx.recipeItem.findMany({
           where: { menuItemId: link.menuItemId },
-          include: { inventoryItem: true }
+          include: { inventoryItem: true },
         });
-
-        const canMakeOne = fullRecipe.every(
-          (r) => r.inventoryItem.currentStock >= r.quantityUsed
-        );
-
-        if (canMakeOne) {
-          await tx.menuItem.update({
-            where: { id: link.menuItemId },
-            data: { available: true }
+        if (fullRecipe.every((r) => r.inventoryItem.currentStock >= r.quantityUsed)) {
+          await tx.menuItem.updateMany({
+            where: { id: link.menuItemId, vendorId: req.vendorId! },
+            data: { available: true },
           });
         }
       }
 
-      return updated;
+      return tx.inventoryItem.findFirst({ where: { id: itemId, vendorId: req.vendorId! } });
     });
 
-    res.json(updatedItem);
+    return res.json(updatedItem);
   } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Failed to refill stock' });
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    return res.status(500).json({ error: 'Failed to refill stock' });
   }
 });
 
-// --- 💳 PAYMENT DATA ROUTES ---
+// --- PAYMENT DATA ROUTES ---
 
-// 1. Save or Update Payment Profile (Clerk ID Sanitized)
-app.post('/api/vendors/:vendorId/payment', async (req, res) => {
+app.post('/api/vendors/:vendorId/payment', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const dbVendorId = await getDbVendorId(req.params.vendorId);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
     const { paymentType, upiId, qrImagePath, razorpayKeyId, razorpayKeySecret, isActive } = req.body;
-    const secureSecret = razorpayKeySecret ? encrypt(razorpayKeySecret) : undefined;
-    const secureUpi = upiId ? encrypt(upiId) : '';
+    const trimmedSecret = typeof razorpayKeySecret === 'string' ? razorpayKeySecret.trim() : '';
+    const secureSecret = trimmedSecret ? encrypt(trimmedSecret) : undefined;
+    const secureUpi = upiId ? encrypt(String(upiId).trim()) : '';
 
     await prisma.paymentData.upsert({
-      where: { vendorId: dbVendorId },
+      where: { vendorId: req.vendorId! },
       update: {
         paymentType,
         upiId: secureUpi,
         qrImagePath,
         razorpayKeyId,
         ...(secureSecret ? { razorpayKeySecret: secureSecret } : {}),
-        isActive
+        isActive,
       },
       create: {
-        vendorId: dbVendorId,
+        vendorId: req.vendorId!,
         paymentType: paymentType || 'UPI',
         upiId: secureUpi,
         qrImagePath: qrImagePath || '',
         razorpayKeyId: razorpayKeyId || '',
         razorpayKeySecret: secureSecret || '',
-        isActive: isActive ?? true
-      }
+        isActive: isActive ?? true,
+      },
     });
-    
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to save payment data' });
+    return res.json({ success: true });
+  } catch {
+    return res.status(500).json({ error: 'Failed to save payment data' });
   }
 });
 
-// 2. Retrieve Decrypted Payment Profile for Settings
-app.get('/api/vendors/:vendorId/payment', async (req, res) => {
+app.get('/api/vendors/:vendorId/payment', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const dbVendorId = await getDbVendorId(req.params.vendorId);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
     const paymentData = await prisma.paymentData.findUnique({
-      where: { vendorId: dbVendorId }
+      where: { vendorId: req.vendorId! },
     });
-    
     if (!paymentData) return res.status(404).json({ error: 'Payment data not found' });
 
-    res.json({
+    return res.json({
       paymentType: paymentData.paymentType,
-      upiId: paymentData.upiId,
+      upiId: safeDecrypt(paymentData.upiId),
       qrImagePath: paymentData.qrImagePath,
       razorpayKeyId: paymentData.razorpayKeyId,
       hasRazorpaySecret: Boolean(paymentData.razorpayKeySecret),
-      isActive: paymentData.isActive
+      isActive: paymentData.isActive,
     });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch payment data' });
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch payment data' });
   }
 });
 
-// 3. Create Razorpay Financial Order
+// Public: Create Razorpay Order (DB-computed amount including promo & ₹10 packing fee)
 app.post('/api/checkout/razorpay', async (req, res) => {
   try {
-    const { vendorId, amount } = req.body;
-    if (!vendorId || amount == null) {
-      return res.status(400).json({ error: 'vendorId and amount are required' });
+    const { vendorId, items, promoCode, packIt } = req.body;
+    if (!vendorId || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'vendorId and cart items are required' });
     }
 
     const dbVendorId = await getDbVendorId(vendorId);
     if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
-    const paymentData = await prisma.paymentData.findUnique({
-      where: { vendorId: dbVendorId }
-    });
+    const { finalTotal } = await calculateVerifiedCart(
+      prisma,
+      dbVendorId,
+      items,
+      promoCode,
+      Boolean(packIt)
+    );
+    if (finalTotal <= 0) {
+      return res.status(400).json({ error: 'Order total must be greater than ₹0 for Razorpay' });
+    }
 
+    const paymentData = await prisma.paymentData.findUnique({
+      where: { vendorId: dbVendorId },
+    });
     if (!paymentData || !paymentData.razorpayKeyId || !paymentData.razorpayKeySecret) {
       return res.status(400).json({ error: 'Restaurant has not configured Razorpay correctly.' });
     }
-    
-    const unscrambledSecret = decrypt(paymentData.razorpayKeySecret);
+
     const razorpay = new Razorpay({
       key_id: paymentData.razorpayKeyId,
-      key_secret: unscrambledSecret
+      key_secret: decrypt(paymentData.razorpayKeySecret),
     });
 
-    const options = {
-      amount: Math.round(amount * 100),
+    const order = await razorpay.orders.create({
+      amount: Math.round(finalTotal * 100),
       currency: 'INR',
-      receipt: `receipt_${Date.now()}`
-    };
+      receipt: `rcpt_${dbVendorId.slice(0, 8)}_${Date.now()}`,
+    });
 
-    const order = await razorpay.orders.create(options);
-    res.json(order);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to create Razorpay order' });
+    return res.json({ ...order, verifiedTotal: finalTotal });
+  } catch (error: any) {
+    if (error.statusCode === 400) return res.status(400).json({ error: error.message });
+    return res.status(500).json({ error: 'Failed to create Razorpay order' });
   }
 });
 
-// 4. Retrieve Public Payment Config for Customer Checkout
+// Public: Payment Config for Customer Checkout
 app.get('/api/vendors/:vendorId/payment/public', async (req, res) => {
   try {
     const dbVendorId = await getDbVendorId(req.params.vendorId);
     if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
-    const vendor = await prisma.vendor.findUnique({
-      where: { id: dbVendorId },
-      include: { paymentData: true }
+    const paymentConfig = await prisma.paymentData.findUnique({
+      where: { vendorId: dbVendorId },
     });
 
-    const rawPaymentData = vendor?.paymentData;
-    const activePaymentConfig = Array.isArray(rawPaymentData) ? rawPaymentData[0] : rawPaymentData;
-
-    if (!activePaymentConfig || !activePaymentConfig.isActive) {
+    if (!paymentConfig || !paymentConfig.isActive) {
       return res.json({ available: false });
     }
 
-    const decryptedUpi = activePaymentConfig.upiId ? decrypt(activePaymentConfig.upiId) : '';
-    res.json({ 
+    return res.json({
       available: true,
-      paymentType: activePaymentConfig.paymentType, 
-      upiId: decryptedUpi, 
-      qrImagePath: activePaymentConfig.qrImagePath,
-      razorpayKeyId: activePaymentConfig.razorpayKeyId
+      paymentType: paymentConfig.paymentType,
+      upiId: safeDecrypt(paymentConfig.upiId),
+      qrImagePath: paymentConfig.qrImagePath,
+      razorpayKeyId: paymentConfig.razorpayKeyId,
     });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to retrieve public payment data' });
+  } catch {
+    return res.status(500).json({ error: 'Failed to retrieve public payment data' });
   }
 });
 
-// --- 📋 MENU ROUTES ---
+// --- MENU ROUTES ---
 
-// 1. Fetch Customer Menu (Includes depleted dishes so they render with Sold-Out badges)
+// Public: Customer Menu
 app.get('/api/vendors/:vendorId/menu', async (req, res) => {
   try {
     const dbVendorId = await getDbVendorId(req.params.vendorId);
@@ -607,87 +851,104 @@ app.get('/api/vendors/:vendorId/menu', async (req, res) => {
 
     const items = await prisma.menuItem.findMany({
       where: { vendorId: dbVendorId },
-      orderBy: [{ available: 'desc' }, { name: 'asc' }]
+      orderBy: [{ available: 'desc' }, { name: 'asc' }],
     });
-    res.json({ items });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch menu' });
+    return res.json({ items });
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch menu' });
   }
 });
 
-// 2. Fetch Menu for Menu Editor
-app.get('/api/vendors/:vendorId/menu-editor', async (req, res) => {
+// Owner-Scoped: Menu Editor CRUD
+app.get('/api/vendors/:vendorId/menu-editor', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const dbVendorId = await getDbVendorId(req.params.vendorId);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
-    const items = await prisma.menuItem.findMany({ 
-      where: { vendorId: dbVendorId },
-      orderBy: { category: 'asc' }
+    const items = await prisma.menuItem.findMany({
+      where: { vendorId: req.vendorId! },
+      orderBy: { category: 'asc' },
     });
-    
-    res.json({ items });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch editor menu' });
+    return res.json({ items });
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch editor menu' });
   }
 });
 
-// 3. Create Menu Item
-app.post('/api/vendors/:vendorId/menu', async (req, res) => {
+app.post('/api/vendors/:vendorId/menu', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const dbVendorId = await getDbVendorId(req.params.vendorId);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
     const newItem = await prisma.menuItem.create({
       data: {
         name: req.body.name,
         category: req.body.category,
         price: Number(req.body.price),
         prep: req.body.prep,
-        veg: req.body.veg,
-        available: req.body.available,
+        veg: Boolean(req.body.veg),
+        available: req.body.available ?? true,
         imageUrl: req.body.imageUrl || null,
         description: req.body.description || null,
         costPrice: req.body.costPrice ? Number(req.body.costPrice) : null,
         emoji: req.body.emoji || null,
         remarks: req.body.remarks || null,
         badgeLabel: req.body.badgeLabel || null,
-        vendorId: dbVendorId
-      }
+        vendorId: req.vendorId!,
+      },
     });
-
-    res.status(201).json(newItem);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to save menu item' });
+    return res.status(201).json(newItem);
+  } catch {
+    return res.status(500).json({ error: 'Failed to save menu item' });
   }
 });
 
-// 4. Update Menu Item
-app.patch('/api/vendors/:vendorId/menu/:itemId', requireAuth, async (req, res) => {
+app.patch('/api/vendors/:vendorId/menu/:itemId', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const updatedItem = await prisma.menuItem.update({
-      where: { id: req.params.itemId as string },
-      data: req.body
+    const itemId = paramStr(req.params.itemId);
+    const {
+      name, category, price, prep, veg, available,
+      imageUrl, description, costPrice, emoji, remarks, badgeLabel,
+    } = req.body;
+
+    const updateData: Record<string, any> = {};
+    if (name !== undefined) updateData.name = name;
+    if (category !== undefined) updateData.category = category;
+    if (price !== undefined) updateData.price = Number(price);
+    if (prep !== undefined) updateData.prep = prep;
+    if (veg !== undefined) updateData.veg = Boolean(veg);
+    if (available !== undefined) updateData.available = Boolean(available);
+    if (imageUrl !== undefined) updateData.imageUrl = imageUrl || null;
+    if (description !== undefined) updateData.description = description || null;
+    if (costPrice !== undefined) updateData.costPrice = costPrice ? Number(costPrice) : null;
+    if (emoji !== undefined) updateData.emoji = emoji || null;
+    if (remarks !== undefined) updateData.remarks = remarks || null;
+    if (badgeLabel !== undefined) updateData.badgeLabel = badgeLabel || null;
+
+    const result = await prisma.menuItem.updateMany({
+      where: { id: itemId, vendorId: req.vendorId! },
+      data: updateData,
     });
-    res.json(updatedItem);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update item' });
+    if (result.count !== 1) return res.status(404).json({ error: 'Menu item not found' });
+
+    const updatedItem = await prisma.menuItem.findFirst({
+      where: { id: itemId, vendorId: req.vendorId! },
+    });
+    return res.json(updatedItem);
+  } catch {
+    return res.status(500).json({ error: 'Failed to update item' });
   }
 });
 
-// 5. Delete Menu Item
-app.delete('/api/vendors/:vendorId/menu/:itemId', requireAuth, async (req, res) => {
+app.delete('/api/vendors/:vendorId/menu/:itemId', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    await prisma.menuItem.delete({ where: { id: req.params.itemId as string } });
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to delete item' });
+    const result = await prisma.menuItem.deleteMany({
+      where: { id: paramStr(req.params.itemId), vendorId: req.vendorId! },
+    });
+    if (result.count !== 1) return res.status(404).json({ error: 'Menu item not found' });
+    return res.json({ success: true });
+  } catch {
+    return res.status(500).json({ error: 'Failed to delete item' });
   }
 });
 
-// --- 🎟️ OFFERS & PROMOS ROUTES ---
+// --- OFFERS & PROMOS ROUTES ---
 
-// 1. Get Promos
+// Public: Active Promos
 app.get('/api/vendors/:vendorId/promos', async (req, res) => {
   try {
     const dbVendorId = await getDbVendorId(req.params.vendorId);
@@ -695,37 +956,29 @@ app.get('/api/vendors/:vendorId/promos', async (req, res) => {
 
     const now = new Date();
     const promos = await prisma.promo.findMany({
-      where: { 
+      where: {
         vendorId: dbVendorId,
         isActive: true,
-        OR: [
-          { expiresAt: null },
-          { expiresAt: { gt: now } }
-        ]
+        OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
       },
-      orderBy: { createdAt: 'desc' }
+      orderBy: { createdAt: 'desc' },
     });
-    res.json({ promos });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch promos' });
+    return res.json({ promos });
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch promos' });
   }
 });
 
-// 2. Create or Update Promo
-app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
+// Owner-Scoped: Create or Update Promo
+app.post('/api/vendors/:vendorId/promos', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const dbVendorId = await getDbVendorId(req.params.vendorId as string);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
     const { code, type, value, minOrderValue, maxUses, expiresAt, applyTo } = req.body;
-    const cleanCode = code.trim().toUpperCase();
+    const cleanCode = String(code || '').trim().toUpperCase();
+    if (!cleanCode) return res.status(400).json({ error: 'Promo code is required' });
 
     const savedPromo = await prisma.promo.upsert({
       where: {
-        vendorId_code: {
-          vendorId: dbVendorId,
-          code: cleanCode
-        }
+        vendorId_code: { vendorId: req.vendorId!, code: cleanCode },
       },
       update: {
         type,
@@ -734,10 +987,10 @@ app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
         maxUses: maxUses ? Number(maxUses) : null,
         expiresAt: expiresAt ? new Date(expiresAt) : null,
         isActive: true,
-        applyTo: applyTo || 'ALL'
+        applyTo: applyTo || 'ALL',
       },
       create: {
-        vendorId: dbVendorId,
+        vendorId: req.vendorId!,
         code: cleanCode,
         type,
         value: Number(value),
@@ -745,115 +998,93 @@ app.post('/api/vendors/:vendorId/promos', requireAuth, async (req, res) => {
         maxUses: maxUses ? Number(maxUses) : null,
         expiresAt: expiresAt ? new Date(expiresAt) : null,
         isActive: true,
-        applyTo: applyTo || 'ALL'
-      }
+        applyTo: applyTo || 'ALL',
+      },
     });
-    
-    res.json(savedPromo);
+    return res.json(savedPromo);
   } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Failed to save promo' });
+    return res.status(500).json({ error: error.message || 'Failed to save promo' });
   }
 });
 
-// 3. Delete Promo
-app.delete('/api/vendors/:vendorId/promos/:promoId', async (req, res) => {
+// Owner-Scoped: Delete Promo
+app.delete('/api/vendors/:vendorId/promos/:promoId', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    await prisma.promo.delete({ where: { id: req.params.promoId } });
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to delete promo' });
+    const result = await prisma.promo.deleteMany({
+      where: { id: paramStr(req.params.promoId), vendorId: req.vendorId! },
+    });
+    if (result.count !== 1) return res.status(404).json({ error: 'Promo not found' });
+    return res.json({ success: true });
+  } catch {
+    return res.status(500).json({ error: 'Failed to delete promo' });
   }
 });
 
-// 4. Verify Promo at Checkout
+// Public: Verify Promo at Checkout (Server DB prices only)
 app.post('/api/vendors/:vendorId/promos/verify', async (req, res) => {
   try {
     const dbVendorId = await getDbVendorId(req.params.vendorId);
     if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
 
-    const { code, cartItems } = req.body; 
-    const cartTotal = cartItems.reduce((sum: number, item: any) => sum + (item.price * item.qty), 0);
-    
-    const promo = await prisma.promo.findFirst({
-      where: { vendorId: dbVendorId, code: code.toUpperCase() }
+    const { code, cartItems } = req.body;
+    const { discountAmount, finalTotal, appliedPromo } = await calculateVerifiedCart(
+      prisma,
+      dbVendorId,
+      cartItems,
+      code,
+      false
+    );
+
+    return res.json({
+      success: true,
+      promoId: appliedPromo?.id || null,
+      discountAmount,
+      newTotal: finalTotal,
     });
-
-    if (!promo || !promo.isActive) return res.status(400).json({ error: 'Invalid or inactive promo code.' });
-    if (cartTotal < promo.minOrderValue) return res.status(400).json({ error: `Cart must be at least ₹${promo.minOrderValue}.` });
-    if (promo.expiresAt && new Date() > promo.expiresAt) return res.status(400).json({ error: 'This promo code has expired.' });
-    if (promo.maxUses !== null && promo.currentUses >= promo.maxUses) return res.status(400).json({ error: 'Usage limit reached.' });
-
-    let eligibleTotal = cartTotal;
-
-    if (promo.applyTo !== 'ALL') {
-      eligibleTotal = cartItems
-        .filter((item: any) => item.category === promo.applyTo || item.name === promo.applyTo)
-        .reduce((sum: number, item: any) => sum + (item.price * item.qty), 0);
-
-      if (eligibleTotal === 0) {
-        return res.status(400).json({ error: `This code only applies to ${promo.applyTo}.` });
-      }
-    }
-
-    let discountAmount = 0;
-    if (promo.type === 'FLAT') {
-      discountAmount = Math.min(promo.value, eligibleTotal);
-    } else if (promo.type === 'PERCENTAGE' || promo.type === 'Percentage discount (%)') {
-      discountAmount = (eligibleTotal * promo.value) / 100;
-    }
-
-    res.json({ 
-      success: true, 
-      promoId: promo.id,
-      discountAmount: Math.round(discountAmount), 
-      newTotal: Math.round(cartTotal - discountAmount) 
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to verify promo.' });
+  } catch (error: any) {
+    if (error.statusCode === 400) return res.status(400).json({ error: error.message });
+    return res.status(500).json({ error: 'Failed to verify promo.' });
   }
 });
 
-// --- 📊 ANALYTICS ROUTE ---
-app.get('/api/vendors/:vendorId/analytics', requireAuth, async (req, res) => {
-  try {
-    const dbVendorId = await getDbVendorId(req.params.vendorId as string);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+// --- ANALYTICS & SALES ROUTES (Owner-Scoped) ---
 
+app.get('/api/vendors/:vendorId/analytics', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
+  try {
     const today = new Date();
     const thirtyDaysAgo = new Date();
     thirtyDaysAgo.setDate(today.getDate() - 30);
 
     const orders = await prisma.order.findMany({
       where: {
-        vendorId: dbVendorId,
+        vendorId: req.vendorId!,
         createdAt: { gte: thirtyDaysAgo },
-        kitchenStatus: 'completed'
+        kitchenStatus: 'completed',
       },
-      include: { items: true }
+      include: { items: true },
     });
 
     const totalOrders = orders.length;
     let totalRevenue = 0;
     let upi = 0, cash = 0, card = 0;
 
-    orders.forEach((o: any) => {
+    orders.forEach((o) => {
       totalRevenue += o.total;
-      if (o.paymentMode === 'UPI') upi++;
+      if (o.paymentMode === 'UPI' || o.paymentMode === 'RAZORPAY') upi++;
       else if (o.paymentMode === 'CASH') cash++;
       else card++;
     });
 
     const avgOrder = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
-    const calcPercent = (val: number) => totalOrders > 0 ? Math.round((val / totalOrders) * 100) : 0;
+    const calcPercent = (val: number) => (totalOrders > 0 ? Math.round((val / totalOrders) * 100) : 0);
 
     const itemTracker: Record<string, any> = {};
-    orders.forEach((order: any) => {
-      const items = Array.isArray(order.items) ? order.items : [];
-      items.forEach((item: any) => {
+    orders.forEach((order) => {
+      (order.items || []).forEach((item) => {
         if (!itemTracker[item.name]) {
           itemTracker[item.name] = { id: item.id, name: item.name, rev: 0, sold: 0 };
         }
-        itemTracker[item.name].rev += (item.price * item.qty);
+        itemTracker[item.name].rev += item.price * item.qty;
         itemTracker[item.name].sold += item.qty;
       });
     });
@@ -861,26 +1092,21 @@ app.get('/api/vendors/:vendorId/analytics', requireAuth, async (req, res) => {
     const topItems = Object.values(itemTracker)
       .sort((a: any, b: any) => b.rev - a.rev)
       .slice(0, 5)
-      .map((item: any) => ({
-        ...item,
-        rev: item.rev.toLocaleString('en-IN')
-      }));
+      .map((item: any) => ({ ...item, rev: item.rev.toLocaleString('en-IN') }));
 
     const dailyRevenue = new Array(30).fill(0);
-    orders.forEach((order: any) => {
+    orders.forEach((order) => {
       const diffTime = Math.abs(today.getTime() - new Date(order.createdAt).getTime());
       const daysAgo = Math.floor(diffTime / (1000 * 60 * 60 * 24));
-      if (daysAgo < 30) {
-        dailyRevenue[29 - daysAgo] += order.total;
-      }
+      if (daysAgo < 30) dailyRevenue[29 - daysAgo] += order.total;
     });
 
     const maxDaily = Math.max(...dailyRevenue, 1);
-    const trend = dailyRevenue.map(rev => Math.round((rev / maxDaily) * 100));
+    const trend = dailyRevenue.map((rev) => Math.round((rev / maxDaily) * 100));
 
     const hourBuckets = { morning: 0, lunch: 0, evening: 0, night: 0 };
-    orders.forEach((order: any) => {
-      const hour = new Date(order.createdAt).getHours(); 
+    orders.forEach((order) => {
+      const hour = new Date(order.createdAt).getHours();
       if (hour >= 9 && hour < 12) hourBuckets.morning++;
       else if (hour >= 12 && hour < 15) hourBuckets.lunch++;
       else if (hour >= 17 && hour < 20) hourBuckets.evening++;
@@ -894,299 +1120,41 @@ app.get('/api/vendors/:vendorId/analytics', requireAuth, async (req, res) => {
       { label: '6–8 PM', percentage: peakPercent(hourBuckets.evening) },
       { label: '8–10 PM', percentage: peakPercent(hourBuckets.night) },
       { label: '12–2 PM', percentage: peakPercent(hourBuckets.lunch) },
-      { label: '9–11 AM', percentage: peakPercent(hourBuckets.morning) }
+      { label: '9–11 AM', percentage: peakPercent(hourBuckets.morning) },
     ];
 
-    res.json({
+    return res.json({
       revenue: totalRevenue.toLocaleString('en-IN'),
       orders: totalOrders,
       avgOrder,
-      rating: 4.8, 
+      rating: 4.8,
       paymentSplit: [
         { label: 'UPI / QR', percentage: calcPercent(upi), color: 'bg-blue-500' },
         { label: 'Cash', percentage: calcPercent(cash), color: 'bg-[#E5B35C]' },
-        { label: 'Card', percentage: calcPercent(card), color: 'bg-gray-500' }
+        { label: 'Card', percentage: calcPercent(card), color: 'bg-gray-500' },
       ],
       peakHours,
       topItems,
-      trend
+      trend,
     });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch analytics' });
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch analytics' });
   }
 });
 
-// --- 🛍️ ORDER & CHECKOUT ENGINE ---
-
-// Create Order (Atomic Stock Decrement & Auto-86)
-app.post('/api/orders', async (req, res) => {
+app.get('/api/vendors/:vendorId/sales', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const { vendorId, tableId, customerName, items, total, paymentMode, customerPhone } = req.body;
-    const dbVendorId = await getDbVendorId(vendorId);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found to attach order to.' });
-
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-
-    const newOrder = await prisma.$transaction(async (tx) => {
-      const lastOrder = await tx.order.findFirst({
-        where: {
-          vendorId: dbVendorId,
-          createdAt: { gte: startOfToday },
-        },
-        orderBy: { token: 'desc' },
-      });
-      const nextToken = lastOrder?.token ? lastOrder.token + 1 : 1;
-
-      const cartItemNames = items.map((i: any) => i.name.trim());
-      const menuItems = await tx.menuItem.findMany({
-        where: {
-          vendorId: dbVendorId,
-          name: { in: cartItemNames, mode: 'insensitive' }
-        },
-        include: {
-          recipes: {
-            include: { inventoryItem: true }
-          }
-        }
-      });
-
-      const ingredientDemand = new Map<string, { item: any; totalNeeded: number; dishNames: string[] }>();
-
-      for (const cartItem of items) {
-        const matchedDish = menuItems.find(
-          (m: any) => m.name.toLowerCase() === cartItem.name.trim().toLowerCase()
-        );
-
-        if (matchedDish && matchedDish.recipes?.length > 0) {
-          for (const recipe of matchedDish.recipes) {
-            const qtyUsed = Number(recipe.quantityUsed) * Number(cartItem.qty);
-            const existing = ingredientDemand.get(recipe.inventoryItemId);
-
-            if (existing) {
-              existing.totalNeeded += qtyUsed;
-              existing.dishNames.push(cartItem.name);
-            } else {
-              ingredientDemand.set(recipe.inventoryItemId, {
-                item: recipe.inventoryItem,
-                totalNeeded: qtyUsed,
-                dishNames: [cartItem.name]
-              });
-            }
-          }
-        }
-      }
-
-      for (const [, demand] of ingredientDemand.entries()) {
-        if (demand.item.currentStock < demand.totalNeeded) {
-          const shortageError: any = new Error(
-            `Insufficient stock for "${demand.item.name}". Required: ${demand.totalNeeded} ${demand.item.unit}, Available: ${demand.item.currentStock} ${demand.item.unit}. Affects: ${demand.dishNames.join(', ')}.`
-          );
-          shortageError.statusCode = 400;
-          throw shortageError;
-        }
-      }
-
-      const createdOrder = await tx.order.create({
-        data: {
-          vendorId: dbVendorId,
-          token: nextToken,
-          customerName: customerName || 'Counter Order',
-          customerPhone: customerPhone || '0000000000',
-          paymentMode,
-          tableId: tableId || 'Counter',
-          total,
-          kitchenStatus: 'pending',
-          items: {
-            create: items.map((cartItem: any) => ({
-              name: cartItem.name,
-              qty: cartItem.qty,
-              price: cartItem.price 
-            }))
-          }
-        }
-      });
-
-      for (const [inventoryId, demand] of ingredientDemand.entries()) {
-        const updatedStock = await tx.inventoryItem.update({
-          where: { id: inventoryId },
-          data: {
-            currentStock: { decrement: demand.totalNeeded }
-          }
-        });
-
-        const dependentRecipes = await tx.recipeItem.findMany({
-          where: { inventoryItemId: updatedStock.id },
-          select: { menuItemId: true, quantityUsed: true }
-        });
-
-        const dishIdsToDisable = dependentRecipes
-          .filter((r) => updatedStock.currentStock < r.quantityUsed)
-          .map((r) => r.menuItemId);
-
-        if (dishIdsToDisable.length > 0) {
-          await tx.menuItem.updateMany({
-            where: { id: { in: dishIdsToDisable } },
-            data: { available: false }
-          });
-        }
-      }
-
-      return createdOrder;
-    });
-
-    res.status(201).json({ id: newOrder.id, tokenNumber: newOrder.token.toString() });
-  } catch (error: any) {
-    if (error.statusCode === 400) {
-      return res.status(400).json({ error: error.message });
-    }
-    res.status(500).json({ error: 'Failed to create order' });
-  }
-});
-
-// Kitchen Queue (Excludes completed and cancelled orders)
-app.get('/api/vendors/:vendorId/kitchen-queue', async (req, res) => {
-  try {
-    const dbVendorId = await getDbVendorId(req.params.vendorId);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
-    const orders = await prisma.order.findMany({
-      where: {
-        vendorId: dbVendorId,
-        kitchenStatus: { notIn: ['completed', 'cancelled', 'rejected'] }
-      },
-      include: { items: true },
-      orderBy: { createdAt: 'asc' }
-    });
-    res.json({ orders });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch queue' });
-  }
-});
-
-// Update Kitchen Status (Restores inventory if cancelled)
-app.patch('/api/orders/:orderId/kitchen-status', requireAuth, async (req, res) => {
-  const { orderId } = req.params;
-  const { status } = req.body;
-
-  try {
-    const updatedOrder = await prisma.$transaction(async (tx) => {
-      const existingOrder = await tx.order.findUnique({
-        where: { id: orderId as string },
-        include: { items: true }
-      });
-
-      if (!existingOrder) throw new Error('Order not found');
-
-      const isCancelling =
-        (status === 'cancelled' || status === 'rejected') &&
-        existingOrder.kitchenStatus !== 'cancelled' &&
-        existingOrder.kitchenStatus !== 'rejected';
-
-      if (isCancelling) {
-        for (const orderItem of existingOrder.items) {
-          const menuItem = await tx.menuItem.findFirst({
-            where: {
-              vendorId: existingOrder.vendorId,
-              name: { equals: orderItem.name.trim(), mode: 'insensitive' }
-            },
-            include: { recipes: true }
-          });
-
-          if (menuItem && menuItem.recipes.length > 0) {
-            for (const recipe of menuItem.recipes) {
-              const restoreQty = Number(recipe.quantityUsed) * Number(orderItem.qty);
-              const restoredStock = await tx.inventoryItem.update({
-                where: { id: recipe.inventoryItemId },
-                data: { currentStock: { increment: restoreQty } }
-              });
-
-              if (restoredStock.currentStock >= recipe.quantityUsed) {
-                await tx.menuItem.update({
-                  where: { id: menuItem.id },
-                  data: { available: true }
-                });
-              }
-            }
-          }
-        }
-      }
-
-      return await tx.order.update({
-        where: { id: orderId as string },
-        data: {
-          kitchenStatus: status,
-          status
-        }
-      });
-    });
-
-    res.json(updatedOrder);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update status' });
-  }
-});
-
-// Check Single Order Status (For Customer Tracker)
-app.get('/api/orders/:orderId/status', async (req, res) => {
-  try {
-    const order = await prisma.order.findUnique({
-      where: { id: req.params.orderId as string },
-      select: { id: true, token: true, kitchenStatus: true, status: true }
-    });
-
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    res.json(order);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch status' });
-  }
-});
-
-// Mock OTP Send
-app.post('/api/otp/send', async (req, res) => {
-  const { phone } = req.body;
-  if (!phone) {
-    return res.status(400).json({ error: 'Phone number is required' });
-  }
-
-  let formattedPhone = phone.replace(/\D/g, ''); 
-  if (formattedPhone.length === 10) formattedPhone = `91${formattedPhone}`;
-
-  return res.json({ sent: true, phone: formattedPhone });
-});
-
-// Mock OTP Verify
-app.post('/api/otp/verify', async (req, res) => {
-  const { phone, otp } = req.body;
-  if (!phone || !otp) {
-    return res.status(400).json({ error: 'Phone number and OTP are both required' });
-  }
-
-  const formattedPhone = phone.replace(/\D/g, '');
-  if (otp === '1234' || otp === '123456') {
-    return res.json({ verified: true, phone: formattedPhone });
-  } else {
-    return res.status(400).json({ error: 'Invalid mock OTP code. Please use 1234.' });
-  }
-});
-
-// Completed Sales Records for History & Reports
-app.get('/api/vendors/:vendorId/sales', requireAuth, async (req, res) => {
-  try {
-    const dbVendorId = await getDbVendorId(req.params.vendorId as string);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
     const requestedDays = Number(req.query.days);
-    const days = Number.isFinite(requestedDays) && requestedDays > 0
-      ? Math.min(Math.floor(requestedDays), 90)
-      : 30;
+    const days =
+      Number.isFinite(requestedDays) && requestedDays > 0
+        ? Math.min(Math.floor(requestedDays), 90)
+        : 30;
 
-    // +1 day buffer prevents IST (UTC+5:30) midnight boundary clipping
     const since = new Date(Date.now() - (days + 1) * 86400000);
 
     const orders = await prisma.order.findMany({
       where: {
-        vendorId: dbVendorId,
+        vendorId: req.vendorId!,
         kitchenStatus: 'completed',
         createdAt: { gte: since },
       },
@@ -1201,100 +1169,462 @@ app.get('/api/vendors/:vendorId/sales', requireAuth, async (req, res) => {
         tableId: true,
         createdAt: true,
         items: {
-          select: {
-            name: true,
-            qty: true,
-            price: true,
-          },
+          select: { name: true, qty: true, price: true },
         },
       },
       orderBy: { createdAt: 'desc' },
     });
 
-    res.json({ orders });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch sales data' });
+    return res.json({ orders });
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch sales data' });
   }
 });
 
-// --- 🎨 BRANDING STUDIO ROUTES ---
+// --- ORDER & CHECKOUT ENGINE ---
 
-app.get('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
+// Public: Create Order (Server DB Pricing + Razorpay HMAC/API/Replay Verification + Atomic Auto-86)
+app.post('/api/orders', async (req, res) => {
   try {
-    const dbVendorId = await getDbVendorId(req.params.vendorId as string);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor profile not found' });
+    const {
+      vendorId,
+      tableId,
+      customerName,
+      customerPhone,
+      items,
+      paymentMode,
+      promoCode,
+      packIt,
+      razorpayOrderId,
+      razorpayPaymentId,
+      razorpaySignature,
+    } = req.body;
 
-    const vendor = await prisma.vendor.findUnique({
-      where: { id: dbVendorId }
+    const dbVendorId = await getDbVendorId(vendorId);
+    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
+
+    const normalizedMode = String(paymentMode || 'CASH').trim().toUpperCase();
+    const allowedModes = ['CASH', 'UPI', 'RAZORPAY', 'ONLINE', 'CARD'];
+    if (!allowedModes.includes(normalizedMode)) {
+      return res.status(400).json({ error: 'Unsupported payment mode' });
+    }
+
+    const isParcel = Boolean(packIt);
+    const preCheck = await calculateVerifiedCart(prisma, dbVendorId, items, promoCode, isParcel);
+    const paymentConfig = await prisma.paymentData.findUnique({
+      where: { vendorId: dbVendorId },
     });
 
+    const requiresRazorpayProof =
+      normalizedMode === 'RAZORPAY' ||
+      normalizedMode === 'ONLINE' ||
+      Boolean(razorpayPaymentId) ||
+      (normalizedMode !== 'CASH' &&
+        paymentConfig?.isActive &&
+        paymentConfig.paymentType?.toUpperCase() === 'RAZORPAY');
+
+    let verifiedRzpOrderId: string | null = null;
+    let verifiedRzpPaymentId: string | null = null;
+
+    if (requiresRazorpayProof) {
+      if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+        return res.status(400).json({ error: 'Missing Razorpay payment verification proof' });
+      }
+      if (!paymentConfig?.razorpayKeyId || !paymentConfig?.razorpayKeySecret) {
+        return res.status(400).json({ error: 'Vendor Razorpay credentials are not configured' });
+      }
+
+      const secret = decrypt(paymentConfig.razorpayKeySecret);
+      const expectedSig = crypto
+        .createHmac('sha256', secret)
+        .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+        .digest('hex');
+
+      const sigBuf = Buffer.from(String(razorpaySignature), 'utf8');
+      const expBuf = Buffer.from(expectedSig, 'utf8');
+      if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+        return res.status(400).json({ error: 'Invalid Razorpay payment signature' });
+      }
+
+      const razorpay = new Razorpay({
+        key_id: paymentConfig.razorpayKeyId,
+        key_secret: secret,
+      });
+      const payment: any = await razorpay.payments.fetch(String(razorpayPaymentId));
+      const expectedPaise = Math.round(preCheck.finalTotal * 100);
+
+      if (
+        payment.order_id !== String(razorpayOrderId) ||
+        Number(payment.amount) !== expectedPaise ||
+        !['captured', 'authorized'].includes(String(payment.status))
+      ) {
+        return res.status(400).json({ error: 'Razorpay payment amount or status mismatch' });
+      }
+
+      verifiedRzpOrderId = String(razorpayOrderId);
+      verifiedRzpPaymentId = String(razorpayPaymentId);
+    }
+
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const newOrder = await prisma.$transaction(async (tx) => {
+      const { verifiedItems, finalTotal, appliedPromo } = await calculateVerifiedCart(
+        tx,
+        dbVendorId,
+        items,
+        promoCode,
+        isParcel
+      );
+
+      if (verifiedRzpPaymentId && finalTotal !== preCheck.finalTotal) {
+        throw Object.assign(new Error('Menu prices changed during checkout. Please retry.'), {
+          statusCode: 409,
+        });
+      }
+
+      if (appliedPromo) {
+        const promoUpdate = await tx.promo.updateMany({
+          where: {
+            id: appliedPromo.id,
+            vendorId: dbVendorId,
+            isActive: true,
+            ...(appliedPromo.maxUses !== null
+              ? { currentUses: { lt: appliedPromo.maxUses } }
+              : {}),
+          },
+          data: { currentUses: { increment: 1 } },
+        });
+        if (promoUpdate.count !== 1) {
+          throw Object.assign(new Error('Promo code usage limit was just reached.'), { statusCode: 400 });
+        }
+      }
+
+      const ingredientDemand = new Map<
+        string,
+        { item: { id: string; name: string; unit: string; currentStock: number }; totalNeeded: number; dishNames: string[] }
+      >();
+
+      for (const dish of verifiedItems) {
+        for (const recipe of dish.recipes) {
+          const qtyUsed = recipe.quantityUsed * dish.qty;
+          const existing = ingredientDemand.get(recipe.inventoryItemId);
+          if (existing) {
+            existing.totalNeeded += qtyUsed;
+            existing.dishNames.push(dish.name);
+          } else {
+            ingredientDemand.set(recipe.inventoryItemId, {
+              item: recipe.inventoryItem,
+              totalNeeded: qtyUsed,
+              dishNames: [dish.name],
+            });
+          }
+        }
+      }
+
+      for (const [, demand] of ingredientDemand.entries()) {
+        if (demand.item.currentStock < demand.totalNeeded) {
+          throw Object.assign(
+            new Error(
+              `Insufficient stock for "${demand.item.name}". Required: ${demand.totalNeeded} ${demand.item.unit}, Available: ${demand.item.currentStock} ${demand.item.unit}.`
+            ),
+            { statusCode: 400 }
+          );
+        }
+      }
+
+      const lastOrder = await tx.order.findFirst({
+        where: { vendorId: dbVendorId, createdAt: { gte: startOfToday } },
+        orderBy: { token: 'desc' },
+      });
+      const nextToken = lastOrder?.token ? lastOrder.token + 1 : 1;
+
+      const createdOrder = await tx.order.create({
+        data: {
+          vendorId: dbVendorId,
+          token: nextToken,
+          customerName: String(customerName || 'Counter Order').slice(0, 120),
+          customerPhone: String(customerPhone || '0000000000').slice(0, 20),
+          paymentMode: normalizedMode,
+          tableId: String(tableId || 'Counter').slice(0, 40),
+          total: finalTotal,
+          kitchenStatus: 'pending',
+          razorpayOrderId: verifiedRzpOrderId,
+          razorpayPaymentId: verifiedRzpPaymentId,
+          items: {
+            create: verifiedItems.map((item) => ({
+              name: item.name,
+              qty: item.qty,
+              price: item.price,
+            })),
+          },
+        },
+      });
+
+      for (const [inventoryId, demand] of ingredientDemand.entries()) {
+        const updatedStock = await tx.inventoryItem.update({
+          where: { id: inventoryId },
+          data: { currentStock: { decrement: demand.totalNeeded } },
+        });
+
+        const dependentRecipes = await tx.recipeItem.findMany({
+          where: { inventoryItemId: updatedStock.id },
+          select: { menuItemId: true, quantityUsed: true },
+        });
+
+        const dishIdsToDisable = dependentRecipes
+          .filter((r) => updatedStock.currentStock < r.quantityUsed)
+          .map((r) => r.menuItemId);
+
+        if (dishIdsToDisable.length > 0) {
+          await tx.menuItem.updateMany({
+            where: { id: { in: dishIdsToDisable }, vendorId: dbVendorId },
+            data: { available: false },
+          });
+        }
+      }
+
+      return createdOrder;
+    });
+
+    return res.status(201).json({
+      id: newOrder.id,
+      tokenNumber: newOrder.token.toString(),
+      total: newOrder.total,
+    });
+  } catch (error: any) {
+    if (error?.code === 'P2002') {
+      return res.status(409).json({ error: 'This payment has already been used for an order.' });
+    }
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ error: error.message });
+    }
+    return res.status(500).json({ error: 'Failed to create order' });
+  }
+});
+
+// Owner-Scoped: Active Kitchen Queue
+app.get('/api/vendors/:vendorId/kitchen-queue', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
+  try {
+    const orders = await prisma.order.findMany({
+      where: {
+        vendorId: req.vendorId!,
+        kitchenStatus: { notIn: ['completed', 'cancelled', 'rejected'] },
+      },
+      include: { items: true },
+      orderBy: { createdAt: 'asc' },
+    });
+    return res.json({ orders });
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch queue' });
+  }
+});
+
+// Owner-Scoped: Atomic Kitchen Status Update (Prevents double-restock on cancel)
+app.patch('/api/orders/:orderId/kitchen-status', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
+  const orderId = paramStr(req.params.orderId);
+  const status = String(req.body.status || '').toLowerCase();
+  const validStatuses = ['pending', 'preparing', 'ready', 'completed', 'cancelled', 'rejected'];
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ error: 'Invalid kitchen status' });
+  }
+
+  try {
+    const updatedOrder = await prisma.$transaction(async (tx) => {
+      const existingOrder = await tx.order.findFirst({
+        where: { id: orderId, vendorId: req.vendorId! },
+        include: { items: true },
+      });
+      if (!existingOrder) throw Object.assign(new Error('Order not found'), { statusCode: 404 });
+
+      const isCancelRequest = status === 'cancelled' || status === 'rejected';
+
+      if (isCancelRequest) {
+        const cancelGate = await tx.order.updateMany({
+          where: {
+            id: orderId,
+            vendorId: req.vendorId!,
+            kitchenStatus: { notIn: ['cancelled', 'rejected'] },
+          },
+          data: { kitchenStatus: status, status },
+        });
+
+        if (cancelGate.count === 1) {
+          const affectedMenuItemIds = new Set<string>();
+
+          for (const orderItem of existingOrder.items) {
+            const menuItem = await tx.menuItem.findFirst({
+              where: {
+                vendorId: req.vendorId!,
+                name: { equals: orderItem.name.trim(), mode: 'insensitive' },
+              },
+              include: { recipes: true },
+            });
+
+            if (menuItem && menuItem.recipes.length > 0) {
+              affectedMenuItemIds.add(menuItem.id);
+              for (const recipe of menuItem.recipes) {
+                const restoreQty = Number(recipe.quantityUsed) * Number(orderItem.qty);
+                await tx.inventoryItem.updateMany({
+                  where: { id: recipe.inventoryItemId, vendorId: req.vendorId! },
+                  data: { currentStock: { increment: restoreQty } },
+                });
+              }
+            }
+          }
+
+          for (const menuItemId of affectedMenuItemIds) {
+            const fullRecipe = await tx.recipeItem.findMany({
+              where: { menuItemId },
+              include: { inventoryItem: true },
+            });
+            if (fullRecipe.every((r) => r.inventoryItem.currentStock >= r.quantityUsed)) {
+              await tx.menuItem.updateMany({
+                where: { id: menuItemId, vendorId: req.vendorId! },
+                data: { available: true },
+              });
+            }
+          }
+        }
+      } else {
+        const result = await tx.order.updateMany({
+          where: { id: orderId, vendorId: req.vendorId! },
+          data: { kitchenStatus: status, status },
+        });
+        if (result.count !== 1) throw Object.assign(new Error('Order not found'), { statusCode: 404 });
+      }
+
+      return tx.order.findFirst({
+        where: { id: orderId, vendorId: req.vendorId! },
+        include: { items: true },
+      });
+    });
+
+    return res.json(updatedOrder);
+  } catch (error: any) {
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    return res.status(500).json({ error: 'Failed to update status' });
+  }
+});
+
+// Public: Single Order Status (Customer Live Tracker)
+app.get('/api/orders/:orderId/status', async (req, res) => {
+  try {
+    const order = await prisma.order.findUnique({
+      where: { id: paramStr(req.params.orderId) },
+      select: { id: true, token: true, kitchenStatus: true, status: true },
+    });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    return res.json(order);
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch status' });
+  }
+});
+
+// Dev-only Mock OTP (Disabled automatically in production)
+if (process.env.NODE_ENV !== 'production') {
+  app.post('/api/otp/send', (req, res) => {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Phone number is required' });
+    let formattedPhone = String(phone).replace(/\D/g, '');
+    if (formattedPhone.length === 10) formattedPhone = `91${formattedPhone}`;
+    return res.json({ sent: true, phone: formattedPhone });
+  });
+
+  app.post('/api/otp/verify', (req, res) => {
+    const { phone, otp } = req.body;
+    if (!phone || !otp) return res.status(400).json({ error: 'Phone number and OTP are both required' });
+    const formattedPhone = String(phone).replace(/\D/g, '');
+    if (otp === '1234' || otp === '123456') {
+      return res.json({ verified: true, phone: formattedPhone });
+    }
+    return res.status(400).json({ error: 'Invalid mock OTP code. Please use 1234.' });
+  });
+}
+
+// --- BRANDING STUDIO ROUTES (Owner-Scoped) ---
+
+app.get('/api/vendors/:vendorId/branding', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
+  try {
+    const vendor = await prisma.vendor.findUnique({
+      where: { id: req.vendorId! },
+      select: {
+        name: true,
+        themeMode: true,
+        accentColor: true,
+        fontFamily: true,
+        buttonRoundness: true,
+        logoUrl: true,
+        bannerUrl: true,
+        showOfferStrip: true,
+        offerText: true,
+      },
+    });
     if (!vendor) return res.status(404).json({ error: 'Vendor profile not found' });
 
     return res.status(200).json({
       storeName: vendor.name || 'Your Store',
       branding: {
-        themeMode: (vendor as any).themeMode || 'dark', 
-        accentColor: (vendor as any).accentColor || '#E5B35C', 
-        fontFamily: (vendor as any).fontFamily || 'font-sans',
-        buttonRoundness: (vendor as any).buttonRoundness || 'rounded-xl',
-        logoUrl: vendor.logoUrl, 
-        bannerUrl: vendor.bannerUrl 
-      }
+        themeMode: vendor.themeMode || 'dark',
+        accentColor: vendor.accentColor || '#E5B35C',
+        fontFamily: vendor.fontFamily || 'font-sans',
+        buttonRoundness: vendor.buttonRoundness || 'rounded-xl',
+        logoUrl: vendor.logoUrl,
+        bannerUrl: vendor.bannerUrl,
+        showOfferStrip: vendor.showOfferStrip,
+        offerText: vendor.offerText,
+      },
     });
-  } catch (error) {
+  } catch {
     return res.status(500).json({ error: 'Internal server failure' });
   }
 });
 
-app.patch('/api/vendors/:vendorId/branding', requireAuth, async (req, res) => {
+app.patch('/api/vendors/:vendorId/branding', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const dbVendorId = await getDbVendorId(req.params.vendorId as string);
-    if (!dbVendorId) return res.status(404).json({ error: 'Vendor not found' });
-
-    const { themeMode, accentColor, fontFamily, buttonRoundness, logoUrl, bannerUrl, showOfferStrip, offerText } = req.body;
+    const {
+      themeMode, accentColor, fontFamily, buttonRoundness,
+      logoUrl, bannerUrl, showOfferStrip, offerText,
+    } = req.body;
 
     const updatedVendor = await prisma.vendor.update({
-      where: { id: dbVendorId }, 
-      data: { 
-        themeMode, 
-        accentColor, 
+      where: { id: req.vendorId! },
+      data: {
+        themeMode,
+        accentColor,
         fontFamily,
         buttonRoundness,
         showOfferStrip,
         offerText,
-        ...(logoUrl && { logoUrl }), 
-        ...(bannerUrl && { bannerUrl }) 
-      } as any 
+        ...(logoUrl && { logoUrl }),
+        ...(bannerUrl && { bannerUrl }),
+      },
+      select: {
+        themeMode: true,
+        accentColor: true,
+        fontFamily: true,
+        buttonRoundness: true,
+        showOfferStrip: true,
+        offerText: true,
+        logoUrl: true,
+        bannerUrl: true,
+      },
     });
-    
-    return res.status(200).json({
-      success: true,
-      branding: {
-        themeMode: (updatedVendor as any).themeMode, 
-        accentColor: (updatedVendor as any).accentColor, 
-        fontFamily: (updatedVendor as any).fontFamily,
-        buttonRoundness: (updatedVendor as any).buttonRoundness,
-        showOfferStrip: (updatedVendor as any).showOfferStrip,
-        offerText: (updatedVendor as any).offerText,
-        logoUrl: updatedVendor.logoUrl, 
-        bannerUrl: updatedVendor.bannerUrl 
-      }
-    });
-  } catch (error) {
+
+    return res.status(200).json({ success: true, branding: updatedVendor });
+  } catch {
     return res.status(500).json({ error: 'Failed to update branding settings' });
   }
 });
 
-// --- 🚨 GLOBAL ERROR CATCHER ---
-app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  console.error('🔥 Server Error:', err.message || err);
-  
-  if (err.message === 'Unauthenticated' || err.message.includes('token')) {
+// --- GLOBAL ERROR CATCHER ---
+app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error('Server Error:', err.message || err);
+  if (err.message === 'Unauthenticated' || String(err.message || '').includes('token')) {
     return res.status(401).json({ error: 'Unauthorized: Invalid or expired session token' });
   }
-
-  res.status(500).json({ error: 'Internal Server Error', details: err.message });
+  return res.status(500).json({ error: 'Internal Server Error', details: err.message });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Pabee Backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Pabee Backend running on port ${PORT}`));

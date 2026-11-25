@@ -112,6 +112,9 @@ model Order {
   items         OrderItem[]
   @@index([vendorId, kitchenStatus, createdAt])
   @@index([vendorId, createdAt])
+
+  razorpayOrderId   String? @unique
+  razorpayPaymentId String? @unique
 }
 
 model OrderItem {
