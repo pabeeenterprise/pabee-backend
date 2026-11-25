@@ -1403,6 +1403,138 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
+// Owner-Scoped: Staff Counter POS Order (Allows counter UPI + manual staff discount safely)
+app.post('/api/vendors/:vendorId/counter-orders', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
+  try {
+    const dbVendorId = req.vendorId!;
+    const {
+      tableId,
+      customerName,
+      customerPhone,
+      items,
+      paymentMode,
+      packIt,
+      manualDiscount,
+    } = req.body;
+
+    const normalizedMode = String(paymentMode || 'CASH').trim().toUpperCase();
+    if (!['CASH', 'UPI', 'CARD'].includes(normalizedMode)) {
+      return res.status(400).json({ error: 'Unsupported counter payment mode' });
+    }
+
+    const isParcel = Boolean(packIt);
+    const rawDiscount = Math.max(0, Math.floor(Number(manualDiscount) || 0));
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const newOrder = await prisma.$transaction(async (tx) => {
+      const { verifiedItems, subtotal, packingFee } = await calculateVerifiedCart(
+        tx,
+        dbVendorId,
+        items,
+        undefined,
+        isParcel
+      );
+
+      const safeDiscount = Math.min(rawDiscount, subtotal);
+      const finalTotal = Math.max(0, Math.round(subtotal - safeDiscount + packingFee));
+
+      const ingredientDemand = new Map<
+        string,
+        { item: { id: string; name: string; unit: string; currentStock: number }; totalNeeded: number }
+      >();
+
+      for (const dish of verifiedItems) {
+        for (const recipe of dish.recipes) {
+          const qtyUsed = recipe.quantityUsed * dish.qty;
+          const existing = ingredientDemand.get(recipe.inventoryItemId);
+          if (existing) {
+            existing.totalNeeded += qtyUsed;
+          } else {
+            ingredientDemand.set(recipe.inventoryItemId, {
+              item: recipe.inventoryItem,
+              totalNeeded: qtyUsed,
+            });
+          }
+        }
+      }
+
+      for (const [, demand] of ingredientDemand.entries()) {
+        if (demand.item.currentStock < demand.totalNeeded) {
+          throw Object.assign(
+            new Error(
+              `Insufficient stock for "${demand.item.name}". Required: ${demand.totalNeeded} ${demand.item.unit}, Available: ${demand.item.currentStock} ${demand.item.unit}.`
+            ),
+            { statusCode: 400 }
+          );
+        }
+      }
+
+      const lastOrder = await tx.order.findFirst({
+        where: { vendorId: dbVendorId, createdAt: { gte: startOfToday } },
+        orderBy: { token: 'desc' },
+      });
+      const nextToken = lastOrder?.token ? lastOrder.token + 1 : 1;
+
+      const createdOrder = await tx.order.create({
+        data: {
+          vendorId: dbVendorId,
+          token: nextToken,
+          customerName: String(customerName || 'Counter Walk-up').slice(0, 120),
+          customerPhone: String(customerPhone || '0000000000').slice(0, 20),
+          paymentMode: normalizedMode,
+          tableId: String(tableId || (isParcel ? 'Parcel' : 'Counter')).slice(0, 40),
+          total: finalTotal,
+          kitchenStatus: 'pending',
+          items: {
+            create: verifiedItems.map((item) => ({
+              name: item.name,
+              qty: item.qty,
+              price: item.price,
+            })),
+          },
+        },
+      });
+
+      for (const [inventoryId, demand] of ingredientDemand.entries()) {
+        const updatedStock = await tx.inventoryItem.update({
+          where: { id: inventoryId },
+          data: { currentStock: { decrement: demand.totalNeeded } },
+        });
+
+        const dependentRecipes = await tx.recipeItem.findMany({
+          where: { inventoryItemId: updatedStock.id },
+          select: { menuItemId: true, quantityUsed: true },
+        });
+
+        const dishIdsToDisable = dependentRecipes
+          .filter((r) => updatedStock.currentStock < r.quantityUsed)
+          .map((r) => r.menuItemId);
+
+        if (dishIdsToDisable.length > 0) {
+          await tx.menuItem.updateMany({
+            where: { id: { in: dishIdsToDisable }, vendorId: dbVendorId },
+            data: { available: false },
+          });
+        }
+      }
+
+      return createdOrder;
+    });
+
+    return res.status(201).json({
+      id: newOrder.id,
+      tokenNumber: newOrder.token.toString(),
+      total: newOrder.total,
+    });
+  } catch (error: any) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ error: error.message });
+    }
+    return res.status(500).json({ error: 'Failed to create counter order' });
+  }
+});
+
 // Owner-Scoped: Active Kitchen Queue
 app.get('/api/vendors/:vendorId/kitchen-queue', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
