@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import compression from 'compression';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient,Prisma } from '@prisma/client';
 import { Webhook } from 'svix';
 import { ClerkExpressRequireAuth } from '@clerk/clerk-sdk-node';
 import Razorpay from 'razorpay';
@@ -356,6 +356,114 @@ async function calculateVerifiedCart(
   return { verifiedItems, subtotal, discountAmount, packingFee, finalTotal, appliedPromo };
 }
 
+const ALLOWED_INVENTORY_UNITS = new Set([
+  'g', 'kg', 'ml', 'l', 'pcs', 'pc', 'plate', 'cup', 'tbsp', 'tsp', 'pack', 'box',
+]);
+
+function getIstDateKey(date = new Date()): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date);
+}
+
+// Atomic daily token generator (safe even for 2 simultaneous orders at 00:00 IST)
+async function allocateDailyToken(tx: Prisma.TransactionClient, vendorId: string): Promise<number> {
+  const dateKey = getIstDateKey();
+  const rows = await tx.$queryRaw<Array<{ lastToken: number }>>`
+    INSERT INTO "VendorDailyCounter" ("vendorId", "dateKey", "lastToken")
+    VALUES (${vendorId}, ${dateKey}, 1)
+    ON CONFLICT ("vendorId", "dateKey")
+    DO UPDATE SET "lastToken" = "VendorDailyCounter"."lastToken" + 1
+    RETURNING "lastToken"
+  `;
+  return Number(rows[0].lastToken);
+}
+
+// Atomic, deadlock-free stock deduction + Auto-86
+async function deductInventoryAndAuto86(
+  tx: Prisma.TransactionClient,
+  vendorId: string,
+  verifiedItems: VerifiedCartItem[]
+): Promise<void> {
+  const ingredientDemand = new Map<
+    string,
+    { name: string; unit: string; totalNeeded: number }
+  >();
+
+  for (const dish of verifiedItems) {
+    for (const recipe of dish.recipes) {
+      if (!Number.isFinite(recipe.quantityUsed) || recipe.quantityUsed <= 0) continue;
+      const qtyUsed = recipe.quantityUsed * dish.qty;
+      const existing = ingredientDemand.get(recipe.inventoryItemId);
+      if (existing) {
+        existing.totalNeeded += qtyUsed;
+      } else {
+        ingredientDemand.set(recipe.inventoryItemId, {
+          name: recipe.inventoryItem.name,
+          unit: recipe.inventoryItem.unit,
+          totalNeeded: qtyUsed,
+        });
+      }
+    }
+  }
+
+  // Deterministic lock order prevents PostgreSQL deadlocks under concurrent orders
+  const sortedEntries = [...ingredientDemand.entries()].sort(([a], [b]) => a.localeCompare(b));
+
+  for (const [inventoryId, demand] of sortedEntries) {
+    const deducted = await tx.inventoryItem.updateMany({
+      where: {
+        id: inventoryId,
+        vendorId,
+        currentStock: { gte: demand.totalNeeded },
+      },
+      data: {
+        currentStock: { decrement: demand.totalNeeded },
+      },
+    });
+
+    if (deducted.count !== 1) {
+      const latest = await tx.inventoryItem.findFirst({
+        where: { id: inventoryId, vendorId },
+        select: { currentStock: true },
+      });
+      const available = latest ? Number(latest.currentStock) : 0;
+      throw Object.assign(
+        new Error(
+          `Insufficient stock for "${demand.name}". Required: ${demand.totalNeeded} ${demand.unit}, Available: ${available} ${demand.unit}.`
+        ),
+        { statusCode: 400 }
+      );
+    }
+
+    const updatedStock = await tx.inventoryItem.findFirst({
+      where: { id: inventoryId, vendorId },
+      select: { id: true, currentStock: true },
+    });
+
+    if (updatedStock) {
+      const dependentRecipes = await tx.recipeItem.findMany({
+        where: { inventoryItemId: updatedStock.id },
+        select: { menuItemId: true, quantityUsed: true },
+      });
+
+      const dishIdsToDisable = dependentRecipes
+        .filter((r) => Number(updatedStock.currentStock) < Number(r.quantityUsed))
+        .map((r) => r.menuItemId);
+
+      if (dishIdsToDisable.length > 0) {
+        await tx.menuItem.updateMany({
+          where: { id: { in: dishIdsToDisable }, vendorId },
+          data: { available: false },
+        });
+      }
+    }
+  }
+}
+
 // --- SETTINGS & PROFILE ROUTES ---
 
 // 1. Authenticated Vendor Bootstrap (Replaces unauthenticated auto-create)
@@ -558,25 +666,54 @@ app.get('/api/vendors/:vendorId/inventory', requireAuth, requireVendorOwner, asy
 
 app.post('/api/vendors/:vendorId/inventory', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
-    const { name, unit, currentStock, minAlert, costPerUnit, totalPurchaseCost } = req.body;
+    const name = String(req.body.name || '').trim();
+    const unit = String(req.body.unit || '').trim().toLowerCase();
+    const currentStock = Number(req.body.currentStock ?? 0);
+    const minAlert = Number(req.body.minAlert ?? 0);
+    const costPerUnit = Number(req.body.costPerUnit ?? 0);
+    const hasPurchaseCost =
+      req.body.totalPurchaseCost !== undefined &&
+      req.body.totalPurchaseCost !== null &&
+      req.body.totalPurchaseCost !== '';
+    const totalPurchaseCost = hasPurchaseCost ? Number(req.body.totalPurchaseCost) : 0;
+
+    if (!name || name.length > 120) {
+      return res.status(400).json({ error: 'Inventory item name is required (max 120 chars)' });
+    }
+    if (!ALLOWED_INVENTORY_UNITS.has(unit)) {
+      return res.status(400).json({ error: `Unsupported unit "${unit}"` });
+    }
+    if (!Number.isFinite(currentStock) || currentStock < 0) {
+      return res.status(400).json({ error: 'Current stock must be a non-negative number' });
+    }
+    if (!Number.isFinite(minAlert) || minAlert < 0) {
+      return res.status(400).json({ error: 'Minimum alert threshold must be a non-negative number' });
+    }
+    if (!Number.isFinite(costPerUnit) || costPerUnit < 0) {
+      return res.status(400).json({ error: 'Cost per unit must be a non-negative number' });
+    }
+    if (!Number.isFinite(totalPurchaseCost) || totalPurchaseCost < 0) {
+      return res.status(400).json({ error: 'Total purchase cost must be a non-negative number' });
+    }
+
     const result = await prisma.$transaction(async (tx) => {
       const item = await tx.inventoryItem.create({
         data: {
           vendorId: req.vendorId!,
-          name: String(name || '').trim(),
+          name,
           unit,
-          currentStock: Number(currentStock) || 0,
-          minAlert: Number(minAlert) || 0,
-          costPerUnit: Number(costPerUnit) || 0,
+          currentStock,
+          minAlert,
+          costPerUnit,
         },
       });
 
-      if (Number(totalPurchaseCost) > 0) {
+      if (totalPurchaseCost > 0) {
         await tx.dailyExpense.create({
           data: {
             vendorId: req.vendorId!,
             description: `Initial Stock: ${item.name} (${currentStock} ${unit})`,
-            amount: Number(totalPurchaseCost),
+            amount: totalPurchaseCost,
             category: 'INVENTORY_PURCHASE',
             date: new Date(),
           },
@@ -584,8 +721,11 @@ app.post('/api/vendors/:vendorId/inventory', requireAuth, requireVendorOwner, as
       }
       return item;
     });
-    return res.json({ success: true, item: result });
-  } catch {
+    return res.status(201).json({ success: true, item: result });
+  } catch (error: any) {
+    if (error?.code === 'P2002') {
+      return res.status(409).json({ error: 'An inventory item with this name already exists' });
+    }
     return res.status(500).json({ error: 'Failed to register inventory item' });
   }
 });
@@ -593,18 +733,37 @@ app.post('/api/vendors/:vendorId/inventory', requireAuth, requireVendorOwner, as
 app.post('/api/vendors/:vendorId/menu/:itemId/recipe', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
     const menuItemId = paramStr(req.params.itemId);
-    const ingredients: Array<{ inventoryItemId: string; quantityUsed: number }> =
-      Array.isArray(req.body.ingredients) ? req.body.ingredients : [];
+    if (!Array.isArray(req.body.ingredients)) {
+      return res.status(400).json({ error: 'ingredients must be an array' });
+    }
 
-    // 1. Verify dish belongs to vendor
+    const parsedIngredients: Array<{ inventoryItemId: string; quantityUsed: number }> = [];
+    const seenIds = new Set<string>();
+
+    for (const raw of req.body.ingredients) {
+      const inventoryItemId = String(raw?.inventoryItemId || '').trim();
+      const quantityUsed = Number(raw?.quantityUsed);
+
+      if (!inventoryItemId) {
+        return res.status(400).json({ error: 'Each ingredient must include inventoryItemId' });
+      }
+      if (!Number.isFinite(quantityUsed) || quantityUsed <= 0) {
+        return res.status(400).json({ error: 'Recipe quantityUsed must be a positive finite number' });
+      }
+      if (seenIds.has(inventoryItemId)) {
+        return res.status(400).json({ error: 'Duplicate ingredient in recipe' });
+      }
+      seenIds.add(inventoryItemId);
+      parsedIngredients.push({ inventoryItemId, quantityUsed });
+    }
+
     const dish = await prisma.menuItem.findFirst({
       where: { id: menuItemId, vendorId: req.vendorId! },
       select: { id: true },
     });
     if (!dish) return res.status(404).json({ error: 'Menu item not found' });
 
-    // 2. Verify EVERY ingredient belongs to this vendor
-    const invIds = [...new Set(ingredients.map((i) => String(i.inventoryItemId)))];
+    const invIds = [...seenIds];
     if (invIds.length > 0) {
       const ownedCount = await prisma.inventoryItem.count({
         where: { id: { in: invIds }, vendorId: req.vendorId! },
@@ -616,12 +775,12 @@ app.post('/api/vendors/:vendorId/menu/:itemId/recipe', requireAuth, requireVendo
 
     await prisma.$transaction(async (tx) => {
       await tx.recipeItem.deleteMany({ where: { menuItemId } });
-      if (ingredients.length > 0) {
+      if (parsedIngredients.length > 0) {
         await tx.recipeItem.createMany({
-          data: ingredients.map((ing) => ({
+          data: parsedIngredients.map((ing) => ({
             menuItemId,
-            inventoryItemId: String(ing.inventoryItemId),
-            quantityUsed: Number(ing.quantityUsed),
+            inventoryItemId: ing.inventoryItemId,
+            quantityUsed: ing.quantityUsed,
           })),
         });
       }
@@ -874,17 +1033,38 @@ app.get('/api/vendors/:vendorId/menu-editor', requireAuth, requireVendorOwner, a
 
 app.post('/api/vendors/:vendorId/menu', requireAuth, requireVendorOwner, async (req: AuthedRequest, res) => {
   try {
+    const name = String(req.body.name || '').trim();
+    const category = String(req.body.category || '').trim();
+    const prep = String(req.body.prep || '10 min').trim();
+    const price = Number(req.body.price);
+    const hasCostPrice =
+      req.body.costPrice !== undefined && req.body.costPrice !== null && req.body.costPrice !== '';
+    const costPrice = hasCostPrice ? Number(req.body.costPrice) : null;
+
+    if (!name || name.length > 120) {
+      return res.status(400).json({ error: 'Menu item name is required (max 120 chars)' });
+    }
+    if (!category || category.length > 60) {
+      return res.status(400).json({ error: 'Category is required' });
+    }
+    if (!Number.isFinite(price) || price <= 0) {
+      return res.status(400).json({ error: 'Price must be a positive finite number' });
+    }
+    if (costPrice !== null && (!Number.isFinite(costPrice) || costPrice < 0)) {
+      return res.status(400).json({ error: 'Cost price must be a non-negative finite number' });
+    }
+
     const newItem = await prisma.menuItem.create({
       data: {
-        name: req.body.name,
-        category: req.body.category,
-        price: Number(req.body.price),
-        prep: req.body.prep,
+        name,
+        category,
+        price,
+        prep,
         veg: Boolean(req.body.veg),
         available: req.body.available ?? true,
         imageUrl: req.body.imageUrl || null,
         description: req.body.description || null,
-        costPrice: req.body.costPrice ? Number(req.body.costPrice) : null,
+        costPrice,
         emoji: req.body.emoji || null,
         remarks: req.body.remarks || null,
         badgeLabel: req.body.badgeLabel || null,
@@ -906,15 +1086,43 @@ app.patch('/api/vendors/:vendorId/menu/:itemId', requireAuth, requireVendorOwner
     } = req.body;
 
     const updateData: Record<string, any> = {};
-    if (name !== undefined) updateData.name = name;
-    if (category !== undefined) updateData.category = category;
-    if (price !== undefined) updateData.price = Number(price);
-    if (prep !== undefined) updateData.prep = prep;
+    if (name !== undefined) {
+      const cleanName = String(name).trim();
+      if (!cleanName || cleanName.length > 120) {
+        return res.status(400).json({ error: 'Menu item name is required (max 120 chars)' });
+      }
+      updateData.name = cleanName;
+    }
+    if (category !== undefined) {
+      const cleanCategory = String(category).trim();
+      if (!cleanCategory || cleanCategory.length > 60) {
+        return res.status(400).json({ error: 'Category is required' });
+      }
+      updateData.category = cleanCategory;
+    }
+    if (price !== undefined) {
+      const numPrice = Number(price);
+      if (!Number.isFinite(numPrice) || numPrice <= 0) {
+        return res.status(400).json({ error: 'Price must be a positive finite number' });
+      }
+      updateData.price = numPrice;
+    }
+    if (prep !== undefined) updateData.prep = String(prep).trim();
     if (veg !== undefined) updateData.veg = Boolean(veg);
     if (available !== undefined) updateData.available = Boolean(available);
     if (imageUrl !== undefined) updateData.imageUrl = imageUrl || null;
     if (description !== undefined) updateData.description = description || null;
-    if (costPrice !== undefined) updateData.costPrice = costPrice ? Number(costPrice) : null;
+    if (costPrice !== undefined) {
+      if (costPrice === null || costPrice === '') {
+        updateData.costPrice = null;
+      } else {
+        const numCost = Number(costPrice);
+        if (!Number.isFinite(numCost) || numCost < 0) {
+          return res.status(400).json({ error: 'Cost price must be a non-negative finite number' });
+        }
+        updateData.costPrice = numCost;
+      }
+    }
     if (emoji !== undefined) updateData.emoji = emoji || null;
     if (remarks !== undefined) updateData.remarks = remarks || null;
     if (badgeLabel !== undefined) updateData.badgeLabel = badgeLabel || null;
@@ -1256,17 +1464,15 @@ app.post('/api/orders', async (req, res) => {
       if (
         payment.order_id !== String(razorpayOrderId) ||
         Number(payment.amount) !== expectedPaise ||
-        !['captured', 'authorized'].includes(String(payment.status))
+        String(payment.currency || '').toUpperCase() !== 'INR' ||
+        String(payment.status) !== 'captured'
       ) {
-        return res.status(400).json({ error: 'Razorpay payment amount or status mismatch' });
+        return res.status(400).json({ error: 'Razorpay payment is not captured or does not match order total' });
       }
 
       verifiedRzpOrderId = String(razorpayOrderId);
       verifiedRzpPaymentId = String(razorpayPaymentId);
     }
-
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
 
     const newOrder = await prisma.$transaction(async (tx) => {
       const { verifiedItems, finalTotal, appliedPromo } = await calculateVerifiedCart(
@@ -1300,44 +1506,8 @@ app.post('/api/orders', async (req, res) => {
         }
       }
 
-      const ingredientDemand = new Map<
-        string,
-        { item: { id: string; name: string; unit: string; currentStock: number }; totalNeeded: number; dishNames: string[] }
-      >();
-
-      for (const dish of verifiedItems) {
-        for (const recipe of dish.recipes) {
-          const qtyUsed = recipe.quantityUsed * dish.qty;
-          const existing = ingredientDemand.get(recipe.inventoryItemId);
-          if (existing) {
-            existing.totalNeeded += qtyUsed;
-            existing.dishNames.push(dish.name);
-          } else {
-            ingredientDemand.set(recipe.inventoryItemId, {
-              item: recipe.inventoryItem,
-              totalNeeded: qtyUsed,
-              dishNames: [dish.name],
-            });
-          }
-        }
-      }
-
-      for (const [, demand] of ingredientDemand.entries()) {
-        if (demand.item.currentStock < demand.totalNeeded) {
-          throw Object.assign(
-            new Error(
-              `Insufficient stock for "${demand.item.name}". Required: ${demand.totalNeeded} ${demand.item.unit}, Available: ${demand.item.currentStock} ${demand.item.unit}.`
-            ),
-            { statusCode: 400 }
-          );
-        }
-      }
-
-      const lastOrder = await tx.order.findFirst({
-        where: { vendorId: dbVendorId, createdAt: { gte: startOfToday } },
-        orderBy: { token: 'desc' },
-      });
-      const nextToken = lastOrder?.token ? lastOrder.token + 1 : 1;
+      await deductInventoryAndAuto86(tx, dbVendorId, verifiedItems);
+      const nextToken = await allocateDailyToken(tx, dbVendorId);
 
       const createdOrder = await tx.order.create({
         data: {
@@ -1360,29 +1530,6 @@ app.post('/api/orders', async (req, res) => {
           },
         },
       });
-
-      for (const [inventoryId, demand] of ingredientDemand.entries()) {
-        const updatedStock = await tx.inventoryItem.update({
-          where: { id: inventoryId },
-          data: { currentStock: { decrement: demand.totalNeeded } },
-        });
-
-        const dependentRecipes = await tx.recipeItem.findMany({
-          where: { inventoryItemId: updatedStock.id },
-          select: { menuItemId: true, quantityUsed: true },
-        });
-
-        const dishIdsToDisable = dependentRecipes
-          .filter((r) => updatedStock.currentStock < r.quantityUsed)
-          .map((r) => r.menuItemId);
-
-        if (dishIdsToDisable.length > 0) {
-          await tx.menuItem.updateMany({
-            where: { id: { in: dishIdsToDisable }, vendorId: dbVendorId },
-            data: { available: false },
-          });
-        }
-      }
 
       return createdOrder;
     });
@@ -1424,8 +1571,6 @@ app.post('/api/vendors/:vendorId/counter-orders', requireAuth, requireVendorOwne
 
     const isParcel = Boolean(packIt);
     const rawDiscount = Math.max(0, Math.floor(Number(manualDiscount) || 0));
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
 
     const newOrder = await prisma.$transaction(async (tx) => {
       const { verifiedItems, subtotal, packingFee } = await calculateVerifiedCart(
@@ -1439,42 +1584,8 @@ app.post('/api/vendors/:vendorId/counter-orders', requireAuth, requireVendorOwne
       const safeDiscount = Math.min(rawDiscount, subtotal);
       const finalTotal = Math.max(0, Math.round(subtotal - safeDiscount + packingFee));
 
-      const ingredientDemand = new Map<
-        string,
-        { item: { id: string; name: string; unit: string; currentStock: number }; totalNeeded: number }
-      >();
-
-      for (const dish of verifiedItems) {
-        for (const recipe of dish.recipes) {
-          const qtyUsed = recipe.quantityUsed * dish.qty;
-          const existing = ingredientDemand.get(recipe.inventoryItemId);
-          if (existing) {
-            existing.totalNeeded += qtyUsed;
-          } else {
-            ingredientDemand.set(recipe.inventoryItemId, {
-              item: recipe.inventoryItem,
-              totalNeeded: qtyUsed,
-            });
-          }
-        }
-      }
-
-      for (const [, demand] of ingredientDemand.entries()) {
-        if (demand.item.currentStock < demand.totalNeeded) {
-          throw Object.assign(
-            new Error(
-              `Insufficient stock for "${demand.item.name}". Required: ${demand.totalNeeded} ${demand.item.unit}, Available: ${demand.item.currentStock} ${demand.item.unit}.`
-            ),
-            { statusCode: 400 }
-          );
-        }
-      }
-
-      const lastOrder = await tx.order.findFirst({
-        where: { vendorId: dbVendorId, createdAt: { gte: startOfToday } },
-        orderBy: { token: 'desc' },
-      });
-      const nextToken = lastOrder?.token ? lastOrder.token + 1 : 1;
+      await deductInventoryAndAuto86(tx, dbVendorId, verifiedItems);
+      const nextToken = await allocateDailyToken(tx, dbVendorId);
 
       const createdOrder = await tx.order.create({
         data: {
@@ -1495,29 +1606,6 @@ app.post('/api/vendors/:vendorId/counter-orders', requireAuth, requireVendorOwne
           },
         },
       });
-
-      for (const [inventoryId, demand] of ingredientDemand.entries()) {
-        const updatedStock = await tx.inventoryItem.update({
-          where: { id: inventoryId },
-          data: { currentStock: { decrement: demand.totalNeeded } },
-        });
-
-        const dependentRecipes = await tx.recipeItem.findMany({
-          where: { inventoryItemId: updatedStock.id },
-          select: { menuItemId: true, quantityUsed: true },
-        });
-
-        const dishIdsToDisable = dependentRecipes
-          .filter((r) => updatedStock.currentStock < r.quantityUsed)
-          .map((r) => r.menuItemId);
-
-        if (dishIdsToDisable.length > 0) {
-          await tx.menuItem.updateMany({
-            where: { id: { in: dishIdsToDisable }, vendorId: dbVendorId },
-            data: { available: false },
-          });
-        }
-      }
 
       return createdOrder;
     });
@@ -1755,7 +1843,10 @@ app.use((err: any, _req: express.Request, res: express.Response, _next: express.
   if (err.message === 'Unauthenticated' || String(err.message || '').includes('token')) {
     return res.status(401).json({ error: 'Unauthorized: Invalid or expired session token' });
   }
-  return res.status(500).json({ error: 'Internal Server Error', details: err.message });
+  return res.status(500).json({
+    error: 'Internal Server Error',
+    ...(process.env.NODE_ENV !== 'production' ? { details: err.message } : {}),
+  });
 });
 
 const PORT = process.env.PORT || 3000;

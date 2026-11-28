@@ -43,7 +43,13 @@ model Vendor {
   paymentData  PaymentData?
 }
 
-// --- UPDATE THESE TWO BLOCKS ---
+model VendorDailyCounter {
+  vendorId  String
+  dateKey   String
+  lastToken Int    @default(0)
+
+  @@id([vendorId, dateKey])
+}
 
 model PaymentData {
   id                String      @id @default(uuid())
